@@ -1,0 +1,124 @@
+name: Market study (public compute, private data)
+
+on:
+  schedule:
+    - cron: '50 5 * * 1-5'
+    - cron: '50 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Операция: check проверяет код без секретов'
+        type: choice
+        required: true
+        default: check
+        options: [check, smoke, campaign, freeze, status]
+      block:
+        description: 'Блок полной сессии (только campaign)'
+        type: choice
+        required: true
+        default: early
+        options: [early, late]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-study-${{ github.event_name == 'schedule' && github.event.schedule == '50 5 * * 1-5' && 'early' || github.event_name == 'schedule' && 'late' || inputs.mode == 'campaign' && inputs.block || inputs.mode }}
+  cancel-in-progress: false
+
+env:
+  MARKET_STUDY_DATA_REPOSITORY: ${{ vars.MARKET_STUDY_DATA_REPOSITORY }}
+  STUDY_HOST_PRIVATE: ${{ github.event.repository.private && 'true' || 'false' }}
+  STUDY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+jobs:
+  code-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '25.4.0'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - name: Explain result
+        run: echo 'Code checks passed. This operation collects no market data and needs no credentials.'
+
+  campaign:
+    if: >-
+      github.event.repository.private == false &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      ((github.event_name == 'schedule' && vars.MARKET_STUDY_ENABLED == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'campaign' && vars.MARKET_STUDY_ENABLED == 'true'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '25.4.0'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npx tsc -p tsconfig.study.json
+      - name: Verify private destination and capture the owned block
+        shell: bash
+        env:
+          MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
+          MARKET_STUDY_ENABLED: ${{ vars.MARKET_STUDY_ENABLED }}
+          STUDY_BLOCK: ${{ github.event_name == 'schedule' && github.event.schedule == '50 5 * * 1-5' && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
+        run: |
+          node .study-dist/src/report/study-host.js campaign
+          node .study-dist/src/report/market-study.js run-block \
+            --repo "$MARKET_STUDY_DATA_REPOSITORY" --block "$STUDY_BLOCK" \
+            --workspace "$RUNNER_TEMP/market-study" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+  utility:
+    if: >-
+      github.event.repository.private == false &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.mode == 'smoke' || inputs.mode == 'freeze' || inputs.mode == 'status')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '25.4.0'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npx tsc -p tsconfig.study.json
+      - name: Run sandbox smoke with private archive
+        if: inputs.mode == 'smoke'
+        env:
+          MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
+        run: |
+          node .study-dist/src/report/study-host.js smoke
+          node .study-dist/src/report/market-study.js smoke \
+            --workspace "$RUNNER_TEMP/market-study" --repo "$MARKET_STUDY_DATA_REPOSITORY"
+      - name: Inspect private state or freeze the tested version
+        if: inputs.mode == 'freeze' || inputs.mode == 'status'
+        env:
+          MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          STUDY_MODE: ${{ inputs.mode }}
+        run: |
+          node .study-dist/src/report/study-host.js "$STUDY_MODE"
+          node .study-dist/src/report/market-study.js "$STUDY_MODE" --repo "$MARKET_STUDY_DATA_REPOSITORY"
+
+      # Raw recordings AND derived reports are uploaded only by the private
+      # release transport above. Do not add public Actions artifact uploads here.

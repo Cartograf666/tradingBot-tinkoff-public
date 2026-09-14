@@ -1,0 +1,32 @@
+{
+  "name": "tradingbot-tinkoff-public",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Публичное исследовательское дополнение к tradingBot-tinkoff: сбор данных песочницы и воспроизводимая проверка стратегий.",
+  "type": "module",
+  "license": "ISC",
+  "engines": {
+    "node": ">=25.4.0 <26"
+  },
+  "scripts": {
+    "test": "npm run study:test",
+    "typecheck": "tsc -p tsconfig.study.json --noEmit",
+    "study:test": "tsc -p tsconfig.study.json && node --test .study-dist/src/research/*.test.js .study-dist/src/core/tinkoff-client.test.js .study-dist/src/report/*.test.js",
+    "study": "TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/market-study.ts",
+    "study:replay": "TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/replay-orderbook.ts",
+    "observe:market": "TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/record-market.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cartograf666/tradingBot-tinkoff-public.git"
+  },
+  "dependencies": {
+    "dotenv": "17.4.2",
+    "tinkoff-invest-api": "7.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "25.6.0",
+    "ts-node": "10.9.2",
+    "typescript": "6.0.3"
+  }
+}

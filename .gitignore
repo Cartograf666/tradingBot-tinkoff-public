@@ -1,0 +1,16 @@
+node_modules/
+.study-dist/
+.test-dist/
+dist/
+.env
+.env.*
+!.env.example
+data/
+reports/
+*.db
+*.db-*
+*.ndjson
+*.tar.gz
+*.pem
+*.key
+.DS_Store

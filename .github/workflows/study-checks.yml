@@ -1,0 +1,48 @@
+name: Market study checks
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/*study*.yml'
+      - 'src/research/**'
+      - 'src/report/record-market.ts'
+      - 'src/report/replay-orderbook.ts'
+      - 'src/report/market-study.ts'
+      - 'src/report/*.test.ts'
+      - 'src/report/study-host.ts'
+      - 'src/core/tinkoff-client*'
+      - 'src/domain/trading.ts'
+      - 'package*.json'
+      - 'tsconfig.study.json'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/*study*.yml'
+      - 'src/research/**'
+      - 'src/report/record-market.ts'
+      - 'src/report/replay-orderbook.ts'
+      - 'src/report/market-study.ts'
+      - 'src/report/*.test.ts'
+      - 'src/report/study-host.ts'
+      - 'src/core/tinkoff-client*'
+      - 'src/domain/trading.ts'
+      - 'package*.json'
+      - 'tsconfig.study.json'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '25.4.0'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run study:test
