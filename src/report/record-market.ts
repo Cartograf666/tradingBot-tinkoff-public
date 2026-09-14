@@ -67,7 +67,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   mkdirSync(args.outputDir, { recursive: true }); mkdirSync(directory, { mode: 0o700 });
   const files = ['src/report/record-market.ts', 'src/research/market-recorder.ts', 'src/research/market-recording.ts',
     'src/research/market-observation.ts', 'src/research/market-recording-report.ts', 'src/research/order-book-costs.ts',
-    'src/research/observation-session.ts', 'src/core/tinkoff-client.ts', 'package-lock.json'];
+    'src/research/observation-session.ts', 'src/core/tinkoff-client.ts', 'certs/russian-trusted-root-ca.pem', 'package-lock.json'];
   const codeHashes = Object.fromEntries(files.map(file => [file, createHash('sha256').update(readFileSync(path.join(root, file))).digest('hex')]));
   const manifest: ObservationManifest = {
     schemaVersion: 1, runId, createdAt: new Date().toISOString(), status: 'PREPARING', endpoint: options.endpoint,

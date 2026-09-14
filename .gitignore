@@ -12,5 +12,6 @@ reports/
 *.ndjson
 *.tar.gz
 *.pem
+!certs/russian-trusted-root-ca.pem
 *.key
 .DS_Store

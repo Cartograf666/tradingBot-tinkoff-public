@@ -17,6 +17,8 @@
 
 Обычный `GITHUB_TOKEN` публичного workflow имеет только чтение содержимого своего репозитория и не заменяет storage token. Рабочий токен брокерского счёта `TINKOFF_API_TOKEN` для этого workflow не требуется и не используется вместо sandbox secret.
 
+Для TLS-подключения к официальной песочнице workflow использует [проверенный публичный сертификат](../certs/README.md) из SDK Т-Банка. Системное хранилище доверия не меняется, проверка имени сервера и сертификатов сохраняется.
+
 Secrets не добавляют в исходники, workflow, issues или сообщения. Перенос локального токена в GitHub — отдельное действие владельца. [Использование Actions Secrets](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets).
 
 ## Первый запуск

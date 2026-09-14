@@ -166,7 +166,15 @@ export function sandboxDiscoveryFailure(error: unknown) {
   const grpcCode = typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 0 && candidate <= 16 ? candidate : null;
   const names: Record<number, string> = { 4: 'DEADLINE_EXCEEDED', 7: 'PERMISSION_DENIED', 8: 'RESOURCE_EXHAUSTED',
     14: 'UNAVAILABLE', 16: 'UNAUTHENTICATED' };
-  return { stage: 'sandbox-discovery', grpcCode, reason: grpcCode === null ? 'DISCOVERY_FAILED' : names[grpcCode] ?? 'RPC_FAILED' };
+  const raw = error as { details?: unknown; message?: unknown } | null;
+  const details = typeof raw?.details === 'string' ? raw.details : typeof raw?.message === 'string' ? raw.message : '';
+  const httpStatus = /HTTP[^\r\n]{0,50}?\b(401|403|404|429|500|502|503)\b/i.exec(details)?.[1];
+  const transport = httpStatus ? `HTTP_${httpStatus}` : /ENOTFOUND|EAI_AGAIN|name resolution/i.test(details) ? 'DNS'
+    : /certificate|ERR_TLS|SSL|TLS handshake/i.test(details) ? 'TLS'
+    : /RST_STREAM|stream reset/i.test(details) ? 'STREAM_RESET'
+    : /ECONNREFUSED|ECONNRESET|connection.*(?:refused|closed|reset)|No connection established/i.test(details) ? 'CONNECTION'
+    : /timeout|timed out/i.test(details) ? 'TIMEOUT' : 'UNCLASSIFIED';
+  return { stage: 'sandbox-discovery', grpcCode, reason: grpcCode === null ? 'DISCOVERY_FAILED' : names[grpcCode] ?? 'RPC_FAILED', transport };
 }
 async function discoverStudyMarket(signal: AbortSignal) {
   const token = process.env.TINKOFF_API_TOKEN_SANDBOX?.trim();

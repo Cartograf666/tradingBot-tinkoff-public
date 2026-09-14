@@ -73,6 +73,7 @@ jobs:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
+          GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: ${{ github.workspace }}/certs/russian-trusted-root-ca.pem
           MARKET_STUDY_ENABLED: ${{ vars.MARKET_STUDY_ENABLED }}
           STUDY_BLOCK: ${{ github.event_name == 'schedule' && github.event.schedule == '50 5 * * 1-5' && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
         run: |
@@ -106,6 +107,7 @@ jobs:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
+          GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: ${{ github.workspace }}/certs/russian-trusted-root-ca.pem
           STUDY_MODE: ${{ inputs.mode }}
         run: |
           node .study-dist/src/report/study-host.js "$STUDY_MODE"

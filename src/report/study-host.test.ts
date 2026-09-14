@@ -53,6 +53,8 @@ test('public workflow keeps all data in private storage and makes code checks in
   assert.match(workflow, /permissions:\n  contents: read/);
   assert.match(workflow, /GH_TOKEN: \$\{\{ secrets\.MARKET_STUDY_STORAGE_TOKEN \}\}/);
   assert.match(workflow, /--repo "\$MARKET_STUDY_DATA_REPOSITORY"/);
+  assert.equal(workflow.match(/GRPC_DEFAULT_SSL_ROOTS_FILE_PATH:/g)?.length, 2);
+  assert.doesNotMatch(workflow, /NODE_TLS_REJECT_UNAUTHORIZED|ssl_target_name_override/);
   assert.match(workflow, /code-check:[\s\S]*?if:.*inputs\.mode == 'check'/);
   assert.doesNotMatch(workflow.split('  code-check:')[1].split('  campaign:')[0], /secrets\./);
 });

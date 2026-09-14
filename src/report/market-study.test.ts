@@ -12,10 +12,13 @@ function http(status: number): Error & { stderr: Buffer } {
 
 test('sandbox discovery diagnostics keep only numeric RPC status and fixed labels', () => {
   assert.deepEqual(sandboxDiscoveryFailure({ code: 16, message: 'private-token', details: 'private-response' }),
-    { stage: 'sandbox-discovery', grpcCode: 16, reason: 'UNAUTHENTICATED' });
+    { stage: 'sandbox-discovery', grpcCode: 16, reason: 'UNAUTHENTICATED', transport: 'UNCLASSIFIED' });
   assert.deepEqual(sandboxDiscoveryFailure({ code: 'private-token' }),
-    { stage: 'sandbox-discovery', grpcCode: null, reason: 'DISCOVERY_FAILED' });
+    { stage: 'sandbox-discovery', grpcCode: null, reason: 'DISCOVERY_FAILED', transport: 'UNCLASSIFIED' });
   assert.equal(sandboxDiscoveryFailure({ code: 14 }).reason, 'UNAVAILABLE');
+  assert.equal(sandboxDiscoveryFailure({ code: 14, details: 'Received HTTP status code 403 private-token' }).transport, 'HTTP_403');
+  assert.equal(sandboxDiscoveryFailure({ code: 14, details: 'Name resolution failed private-token' }).transport, 'DNS');
+  assert.doesNotMatch(JSON.stringify(sandboxDiscoveryFailure({ code: 14, details: 'SSL private-token' })), /private-token/);
 });
 
 test('state branch bootstrap creates from exact default SHA and tolerates only a confirmed concurrent race', async () => {

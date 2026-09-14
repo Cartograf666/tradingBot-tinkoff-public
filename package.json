@@ -12,9 +12,9 @@
     "test": "npm run study:test",
     "typecheck": "tsc -p tsconfig.study.json --noEmit",
     "study:test": "tsc -p tsconfig.study.json && node --test .study-dist/src/research/*.test.js .study-dist/src/core/tinkoff-client.test.js .study-dist/src/report/*.test.js",
-    "study": "TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/market-study.ts",
+    "study": "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=certs/russian-trusted-root-ca.pem TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/market-study.ts",
     "study:replay": "TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/replay-orderbook.ts",
-    "observe:market": "TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/record-market.ts"
+    "observe:market": "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=certs/russian-trusted-root-ca.pem TS_NODE_PROJECT=tsconfig.study.json node --loader ts-node/esm src/report/record-market.ts"
   },
   "repository": {
     "type": "git",
