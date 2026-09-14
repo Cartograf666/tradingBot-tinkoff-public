@@ -1,12 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { resolveStudyHost, verifyPrivateStudyTarget } from './study-host.js';
+import { resolveStudyHost, studyAccessFailure, verifyPrivateStudyTarget } from './study-host.js';
 
 const configured = (): NodeJS.ProcessEnv => ({ GITHUB_REPOSITORY: 'owner/study-public',
   MARKET_STUDY_DATA_REPOSITORY: 'owner/study-data', MARKET_STUDY_STORAGE_TOKEN: 'test-storage-credential',
   TINKOFF_API_TOKEN_SANDBOX: 'test-sandbox-credential', STUDY_HOST_PRIVATE: 'false',
   STUDY_DEFAULT_BRANCH: 'main', GITHUB_REF: 'refs/heads/main', MARKET_STUDY_ENABLED: 'true' });
+
+test('storage access diagnostics distinguish common HTTP failures without echoing upstream data', () => {
+  for (const status of [401, 403, 404]) {
+    const message = studyAccessFailure(`gh: private response test-secret-do-not-log (HTTP ${status})`);
+    assert.match(message, new RegExp(`HTTP ${status}`));
+    assert.doesNotMatch(message, /test-secret-do-not-log|private response/);
+  }
+  assert.equal(studyAccessFailure('unexpected error containing test-secret-do-not-log'),
+    'Cannot access the private data repository with MARKET_STUDY_STORAGE_TOKEN');
+});
 
 test('public study explicitly targets private storage without returning credential values', () => {
   const env = configured();

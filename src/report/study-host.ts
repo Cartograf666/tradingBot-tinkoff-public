@@ -6,6 +6,18 @@ export type StudyOperation = 'campaign' | 'smoke' | 'freeze' | 'status';
 class StudyHostError extends Error {}
 const repositoryName = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
+/** Never echo CLI stderr: it can contain upstream response or credential data. */
+export function studyAccessFailure(stderr: string): string {
+  const status = /\bHTTP (401|403|404)\b/.exec(stderr)?.[1];
+  const advice: Record<string, string> = {
+    '401': 'GitHub rejected the storage credential; replace it with a valid, unexpired token',
+    '403': 'GitHub denied storage access; check token permissions and repository policies',
+    '404': 'GitHub cannot expose the private target to this token; check Only select repositories includes the configured PRIVATE repository',
+  };
+  return status ? `Storage check failed (HTTP ${status}). ${advice[status]}.`
+    : 'Cannot access the private data repository with MARKET_STUDY_STORAGE_TOKEN';
+}
+
 /** Public compute must explicitly target a DIFFERENT, private data repository.
  * The public repository's automatic GITHUB_TOKEN is never a storage fallback. */
 export function resolveStudyHost(environment: NodeJS.ProcessEnv, operation: StudyOperation): string {
@@ -39,8 +51,8 @@ async function main() {
   const target = resolveStudyHost(process.env, operation as StudyOperation);
   await verifyPrivateStudyTarget(target, repository => new Promise((resolve, reject) => {
     execFile('gh', ['api', `/repos/${repository}`], { encoding: 'utf8', maxBuffer: 1024 * 1024,
-      env: { ...process.env, GH_TOKEN: process.env.MARKET_STUDY_STORAGE_TOKEN, GITHUB_TOKEN: '' } }, (error, stdout) => {
-      if (error) { reject(new StudyHostError('Cannot access the private data repository with MARKET_STUDY_STORAGE_TOKEN')); return; }
+      env: { ...process.env, GH_TOKEN: process.env.MARKET_STUDY_STORAGE_TOKEN, GITHUB_TOKEN: '' } }, (error, stdout, stderr) => {
+      if (error) { reject(new StudyHostError(studyAccessFailure(stderr))); return; }
       try { resolve(JSON.parse(stdout)); } catch { reject(new StudyHostError('Invalid repository response')); }
     });
   }));
