@@ -3,12 +3,20 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, ensureStateBranch, ledgerReadme, runAfterBlockCheck, waitUntil } from './market-study.js';
+import { assessStudyChunk, ensureStateBranch, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, waitUntil } from './market-study.js';
 import { createStudyLedger, type StudyDayReceipt } from '../research/study-state.js';
 
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('sandbox discovery diagnostics keep only numeric RPC status and fixed labels', () => {
+  assert.deepEqual(sandboxDiscoveryFailure({ code: 16, message: 'private-token', details: 'private-response' }),
+    { stage: 'sandbox-discovery', grpcCode: 16, reason: 'UNAUTHENTICATED' });
+  assert.deepEqual(sandboxDiscoveryFailure({ code: 'private-token' }),
+    { stage: 'sandbox-discovery', grpcCode: null, reason: 'DISCOVERY_FAILED' });
+  assert.equal(sandboxDiscoveryFailure({ code: 14 }).reason, 'UNAVAILABLE');
+});
 
 test('state branch bootstrap creates from exact default SHA and tolerates only a confirmed concurrent race', async () => {
   const calls: string[][] = [];

@@ -161,12 +161,22 @@ function dayStartUtc(date: string): number {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date); if (!match) throw new Error('Invalid study date');
   return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) - 3 * 3_600_000;
 }
+export function sandboxDiscoveryFailure(error: unknown) {
+  const candidate = (error as { code?: unknown } | null)?.code;
+  const grpcCode = typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 0 && candidate <= 16 ? candidate : null;
+  const names: Record<number, string> = { 4: 'DEADLINE_EXCEEDED', 7: 'PERMISSION_DENIED', 8: 'RESOURCE_EXHAUSTED',
+    14: 'UNAVAILABLE', 16: 'UNAUTHENTICATED' };
+  return { stage: 'sandbox-discovery', grpcCode, reason: grpcCode === null ? 'DISCOVERY_FAILED' : names[grpcCode] ?? 'RPC_FAILED' };
+}
 async function discoverStudyMarket(signal: AbortSignal) {
   const token = process.env.TINKOFF_API_TOKEN_SANDBOX?.trim();
   if (!token) throw new Error('TINKOFF_API_TOKEN_SANDBOX is required');
   const api = new TinkoffInvestApi({ token, endpoint: TINKOFF_SANDBOX_ENDPOINT });
   try {
     return await discoverMarketPilot(api, STUDY_TICKERS, Date.now(), signal);
+  } catch (error) {
+    console.error(JSON.stringify(sandboxDiscoveryFailure(error)));
+    throw error;
   } finally {
     const closable = api as TinkoffInvestApi & { channel?: { close(): void } };
     closable.channel?.close();
