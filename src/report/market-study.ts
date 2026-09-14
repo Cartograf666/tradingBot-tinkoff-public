@@ -266,26 +266,40 @@ async function ensurePrivateRepository(repository: string): Promise<void> {
   const repo = await ghJson(['api', `/repos/${repository}`]);
   if (repo.private !== true) throw new Error('Market-study raw data requires a private GitHub repository');
 }
+/** The by-tag endpoint excludes drafts. List authenticated releases instead. */
+export async function findDraftRelease(repository: string,
+  request: (args: string[]) => Promise<unknown> = ghJson): Promise<{ id: number } | null> {
+  let found: { id: number } | null = null;
+  for (let page = 1; page <= 10; page += 1) {
+    const releases = await request(['api', `/repos/${repository}/releases?per_page=100&page=${page}`]);
+    if (!Array.isArray(releases)) throw new Error('Invalid release inventory');
+    for (const raw of releases) {
+      if (!raw || typeof raw !== 'object' || raw.tag_name !== STUDY_RELEASE_TAG) continue;
+      if (raw.draft !== true || !Number.isSafeInteger(raw.id) || raw.id <= 0) {
+        throw new Error('Study archive release must be a valid private draft');
+      }
+      if (found) throw new Error('Multiple study archive drafts require reconciliation');
+      found = { id: raw.id };
+    }
+    if (releases.length < 100) return found;
+  }
+  throw new Error('Repository release inventory exceeds the supported limit');
+}
 async function ensureDraftRelease(repository: string): Promise<void> {
   await ensurePrivateRepository(repository);
+  if (await findDraftRelease(repository)) return;
   try {
-    const release = await ghJson(['api', `/repos/${repository}/releases/tags/${STUDY_RELEASE_TAG}`]);
-    if (release.draft !== true) throw new Error('Study archive release must remain private draft');
-  } catch (error) {
-    if (ghErrorStatus(error) !== 404) throw error;
-    try {
-      await runFile('gh', ['release', 'create', STUDY_RELEASE_TAG, '--repo', repository, '--draft',
-        '--title', 'Market study immutable archive', '--notes', 'Private draft release for read-only market-study chunks.']);
-    } catch (createError) {
-      const release = await ghJson(['api', `/repos/${repository}/releases/tags/${STUDY_RELEASE_TAG}`]);
-      if (release.draft !== true) throw createError;
-    }
+    await runFile('gh', ['release', 'create', STUDY_RELEASE_TAG, '--repo', repository, '--draft',
+      '--title', 'Market study immutable archive', '--notes', 'Private draft release for read-only market-study chunks.']);
+  } catch (createError) {
+    if (!await findDraftRelease(repository)) throw createError;
   }
+  if (!await findDraftRelease(repository)) throw new Error('Created archive draft was not confirmed');
 }
 interface ReleaseAsset { id: number; name: string; size: number; digest?: string }
 async function releaseAssets(repository: string): Promise<ReleaseAsset[]> {
-  const release = await ghJson(['api', `/repos/${repository}/releases/tags/${STUDY_RELEASE_TAG}`]);
-  if (release.draft !== true || !Number.isSafeInteger(Number(release.id))) throw new Error('Invalid draft release inventory');
+  const release = await findDraftRelease(repository);
+  if (!release) throw new Error('Archive draft is missing from the release inventory');
   const result: ReleaseAsset[] = [];
   for (let page = 1; page <= 10; page += 1) {
     const response = await ghJson(['api', `/repos/${repository}/releases/${Number(release.id)}/assets?per_page=100&page=${page}`]);

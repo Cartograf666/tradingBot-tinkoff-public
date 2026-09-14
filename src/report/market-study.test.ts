@@ -3,12 +3,34 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, ensureStateBranch, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, waitUntil } from './market-study.js';
+import { assessStudyChunk, ensureStateBranch, findDraftRelease, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, waitUntil } from './market-study.js';
 import { createStudyLedger, type StudyDayReceipt } from '../research/study-state.js';
+import { STUDY_RELEASE_TAG } from '../research/study-protocol.js';
 
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('archive lookup finds an authenticated draft beyond the first release page without by-tag lookup', async () => {
+  const calls: string[][] = [];
+  const result = await findDraftRelease('owner/private', async args => {
+    calls.push(args);
+    assert.doesNotMatch(args[1], /\/tags\//);
+    return args[1].endsWith('page=1') ? Array.from({ length: 100 }, (_, id) => ({ id: id + 1, tag_name: `other-${id}` }))
+      : [{ id: 123, tag_name: STUDY_RELEASE_TAG, draft: true }];
+  });
+  assert.deepEqual(result, { id: 123 });
+  assert.equal(calls.length, 2);
+  assert.equal(await findDraftRelease('owner/private', async () => []), null);
+});
+
+test('archive lookup rejects published, malformed or ambiguous archive destinations', async () => {
+  const draft = { id: 123, tag_name: STUDY_RELEASE_TAG, draft: true };
+  for (const releases of [[{ ...draft, draft: false }], [{ ...draft, id: 0 }], [draft, { ...draft, id: 124 }], {}]) {
+    await assert.rejects(findDraftRelease('owner/private', async () => releases));
+  }
+  await assert.rejects(findDraftRelease('owner/private', async () => { throw http(403); }), /HTTP 403/);
+});
 
 test('sandbox discovery diagnostics keep only numeric RPC status and fixed labels', () => {
   assert.deepEqual(sandboxDiscoveryFailure({ code: 16, message: 'private-token', details: 'private-response' }),
