@@ -11,7 +11,7 @@ on:
         type: choice
         required: true
         default: check
-        options: [check, smoke, campaign, freeze, status]
+        options: [check, preflight, smoke, campaign, freeze, status]
       block:
         description: 'Блок полной сессии (только campaign)'
         type: choice
@@ -87,7 +87,7 @@ jobs:
       github.event.repository.private == false &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'smoke' || inputs.mode == 'freeze' || inputs.mode == 'status')
+      (inputs.mode == 'preflight' || inputs.mode == 'smoke' || inputs.mode == 'freeze' || inputs.mode == 'status')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -100,15 +100,16 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npx tsc -p tsconfig.study.json
-      - name: Run sandbox smoke with private archive
-        if: inputs.mode == 'smoke'
+      - name: Verify sandbox access or run market smoke with private archive
+        if: inputs.mode == 'preflight' || inputs.mode == 'smoke'
         env:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
+          STUDY_MODE: ${{ inputs.mode }}
         run: |
-          node .study-dist/src/report/study-host.js smoke
-          node .study-dist/src/report/market-study.js smoke \
+          node .study-dist/src/report/study-host.js "$STUDY_MODE"
+          node .study-dist/src/report/market-study.js "$STUDY_MODE" \
             --workspace "$RUNNER_TEMP/market-study" --repo "$MARKET_STUDY_DATA_REPOSITORY"
       - name: Inspect private state or freeze the tested version
         if: inputs.mode == 'freeze' || inputs.mode == 'status'

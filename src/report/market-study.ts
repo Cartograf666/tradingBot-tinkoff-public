@@ -161,22 +161,51 @@ function dayStartUtc(date: string): number {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date); if (!match) throw new Error('Invalid study date');
   return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) - 3 * 3_600_000;
 }
-async function discoverBlockPlan(block: StudyBlock, signal: AbortSignal): Promise<StudyBlockPlan> {
+async function discoverStudyMarket(signal: AbortSignal) {
   const token = process.env.TINKOFF_API_TOKEN_SANDBOX?.trim();
   if (!token) throw new Error('TINKOFF_API_TOKEN_SANDBOX is required');
   const api = new TinkoffInvestApi({ token, endpoint: TINKOFF_SANDBOX_ENDPOINT });
   try {
-    const now = Date.now();
-    const moscowDate = new Date(now + 3 * 3_600_000).toISOString().slice(0, 10);
-    const discovery = await discoverMarketPilot(api, STUDY_TICKERS, now, signal);
-    const window = nextMainSessionWindow(discovery.instruments, discovery.intervals, dayStartUtc(moscowDate), 1);
-    if (!window) throw new Error('Fresh API calendar has no common main session');
-    const plan = planStudyBlock(moscowDate, window.start, window.end, block, now);
-    if (!plan) throw new Error('Current launch is outside the owned study block window');
-    return plan;
+    return await discoverMarketPilot(api, STUDY_TICKERS, Date.now(), signal);
   } finally {
     const closable = api as TinkoffInvestApi & { channel?: { close(): void } };
     closable.channel?.close();
+  }
+}
+async function discoverBlockPlan(block: StudyBlock, signal: AbortSignal): Promise<StudyBlockPlan> {
+  const discovery = await discoverStudyMarket(signal), now = Date.now();
+  const moscowDate = new Date(now + 3 * 3_600_000).toISOString().slice(0, 10);
+  const window = nextMainSessionWindow(discovery.instruments, discovery.intervals, dayStartUtc(moscowDate), 1);
+  if (!window) throw new Error('Fresh API calendar has no common main session');
+  const plan = planStudyBlock(moscowDate, window.start, window.end, block, now);
+  if (!plan) throw new Error('Current launch is outside the owned study block window');
+  return plan;
+}
+
+/** Runs at any hour; proves sandbox authentication AND both private write paths.
+ * It deliberately makes no claim about market stream quality. */
+async function preflight(workspace: string, repository: string, signal: AbortSignal) {
+  console.log('Preflight: checking sandbox instruments and main-session calendar.');
+  const discovery = await discoverStudyMarket(signal);
+  const nextSession = nextMainSessionWindow(discovery.instruments, discovery.intervals, Date.now(), 60_000);
+  if (!nextSession) throw new Error('No upcoming common main session is available');
+  signal.throwIfAborted();
+  console.log('Preflight: verifying private ledger write and archive upload.');
+  const ledger = await updateRemoteLedger(repository, current => current, 'Verify market study state storage');
+  mkdirSync(path.resolve(workspace), { recursive: true });
+  const directory = mkdtempSync(path.join(path.resolve(workspace), 'preflight-'));
+  let archive: string | undefined;
+  try {
+    const receipt = { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH, diagnosticOnly: true, counted: false,
+      sandboxEndpoint: TINKOFF_SANDBOX_ENDPOINT, instrumentCount: discovery.instruments.length,
+      nextSession, marketStreamChecked: false, phase: ledger.phase, checkedAt: new Date().toISOString() };
+    atomicJson(path.join(directory, 'preflight.json'), receipt);
+    archive = await archiveChunk(directory, `preflight-${randomUUID()}.tar.gz`);
+    await uploadConfirmedAsset(repository, archive);
+    return { action: 'PREFLIGHT_COMPLETE', ...receipt, privateArchiveConfirmed: true };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    if (archive) rmSync(archive, { force: true });
   }
 }
 
@@ -306,6 +335,18 @@ export async function waitUntil(when: number, signal: AbortSignal): Promise<void
     signal.addEventListener('abort', stop, { once: true });
     if (signal.aborted) stop();
   });
+}
+
+/** The probe resolves only after quality, replay and private upload all pass.
+ * Keep the original chunk clock: probe time is a real gap in daily coverage. */
+export async function runAfterBlockCheck<T>(notBefore: number, signal: AbortSignal,
+  probe: () => Promise<unknown>, capture: () => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  await waitUntil(notBefore, signal);
+  signal.throwIfAborted();
+  await probe();
+  signal.throwIfAborted();
+  return capture();
 }
 
 function sameHashes(left: Record<string, string>, right: Record<string, string>): boolean {
@@ -491,42 +532,47 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
   let persisted = await updateRemoteLedger(repository, ledger => beginStudyAttempt(ledger, { runId, runAttempt,
     sessionDate: plan.sessionDate, block, mode: 'COUNTED', startedAt: new Date().toISOString() }), `Begin ${plan.sessionDate} ${block}`);
   assertFrozenRuntime(persisted);
-  await waitUntil(Date.parse(plan.captureNotBefore), signal);
-  let uploaded = 0;
-  for (const chunk of plan.chunks) {
-    if (signal.aborted) throw new Error('Study block aborted');
-    await waitUntil(Date.parse(chunk.plannedStart), signal);
-    const seconds = chunkDurationSeconds(chunk, Date.now());
-    if (seconds <= 0) continue;
-    persisted = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
-    assertFrozenRuntime(persisted);
-    const directory = await recordMarket(recorderArguments(workspace, seconds, 'main'), process.cwd());
-    const quality = assessStudyChunk(directory, chunk), identity = readManifestIdentity(directory);
-    const assetName = `study-${plan.sessionDate}-${block}-${String(chunk.index).padStart(2, '0')}-${runId}-${runAttempt}.tar.gz`;
-    const draft: ChunkDraft = { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH, assetName,
-      releaseTag: STUDY_RELEASE_TAG, attemptId, chunkId: `${plan.sessionDate}:${block}:${chunk.index}`,
-      sessionDate: plan.sessionDate, phase: 'DEVELOPMENT', block, chunkIndex: chunk.index,
-      plannedStart: chunk.plannedStart, plannedEnd: chunk.plannedEnd, runId: identity.runId,
-      manifestHash: identity.manifestHash, recordingHash: identity.recordingHash,
-      replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()), quality: quality.status,
-      uploadedAt: new Date().toISOString() };
-    const attempt = persisted.attempts.find(item => item.attemptId === attemptId);
-    if (!attempt?.phase) throw new Error('Persisted study attempt disappeared');
-    draft.phase = attempt.phase;
-    atomicJson(path.join(directory, 'study-chunk-receipt.json'), draft);
-    const archive = await archiveChunk(directory, assetName), archiveHash = sha256File(archive);
-    const asset = await uploadConfirmedAsset(repository, archive);
-    const receipt: StudyChunkReceipt = { ...draft, assetId: asset.id, assetDigest: asset.digest ?? `sha256:${archiveHash}`,
-      assetBytes: asset.size || statSync(archive).size, archiveSha256: archiveHash };
-    await updateRemoteLedger(repository, current => acceptStudyChunk(current, receipt), `Accept ${receipt.chunkId}`);
-    uploaded += 1;
-  }
-  const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
-  return { plan, chunks: uploaded, reportPath };
+  return runAfterBlockCheck(Date.parse(plan.captureNotBefore), signal, async () => {
+    console.log('Automatic block check: recording 60 seconds of exchange main-session data.');
+    await smoke(workspace, repository);
+    console.log('Automatic block check passed: quality, replay and private archive confirmed.');
+  }, async () => {
+    let uploaded = 0;
+    for (const chunk of plan.chunks) {
+      if (signal.aborted) throw new Error('Study block aborted');
+      await waitUntil(Date.parse(chunk.plannedStart), signal);
+      const seconds = chunkDurationSeconds(chunk, Date.now());
+      if (seconds <= 0) continue;
+      persisted = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+      assertFrozenRuntime(persisted);
+      const directory = await recordMarket(recorderArguments(workspace, seconds, 'main'), process.cwd());
+      const quality = assessStudyChunk(directory, chunk), identity = readManifestIdentity(directory);
+      const assetName = `study-${plan.sessionDate}-${block}-${String(chunk.index).padStart(2, '0')}-${runId}-${runAttempt}.tar.gz`;
+      const draft: ChunkDraft = { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH, assetName,
+        releaseTag: STUDY_RELEASE_TAG, attemptId, chunkId: `${plan.sessionDate}:${block}:${chunk.index}`,
+        sessionDate: plan.sessionDate, phase: 'DEVELOPMENT', block, chunkIndex: chunk.index,
+        plannedStart: chunk.plannedStart, plannedEnd: chunk.plannedEnd, runId: identity.runId,
+        manifestHash: identity.manifestHash, recordingHash: identity.recordingHash,
+        replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()), quality: quality.status,
+        uploadedAt: new Date().toISOString() };
+      const attempt = persisted.attempts.find(item => item.attemptId === attemptId);
+      if (!attempt?.phase) throw new Error('Persisted study attempt disappeared');
+      draft.phase = attempt.phase;
+      atomicJson(path.join(directory, 'study-chunk-receipt.json'), draft);
+      const archive = await archiveChunk(directory, assetName), archiveHash = sha256File(archive);
+      const asset = await uploadConfirmedAsset(repository, archive);
+      const receipt: StudyChunkReceipt = { ...draft, assetId: asset.id, assetDigest: asset.digest ?? `sha256:${archiveHash}`,
+        assetBytes: asset.size || statSync(archive).size, archiveSha256: archiveHash };
+      await updateRemoteLedger(repository, current => acceptStudyChunk(current, receipt), `Accept ${receipt.chunkId}`);
+      uploaded += 1;
+    }
+    const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
+    return { plan, chunks: uploaded, reportPath };
+  });
 }
 
 async function smoke(workspace: string, repository?: string): Promise<string> {
-  const directory = await recordMarket(recorderArguments(workspace, 60, 'any'), process.cwd());
+  const directory = await recordMarket(recorderArguments(workspace, 60, 'main'), process.cwd());
   const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
   if (manifest.status !== 'COMPLETE') throw new Error('Smoke capture did not complete');
   const quality = assessStudyChunk(directory);
@@ -549,6 +595,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const controller = new AbortController(), stop = () => controller.abort();
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   try {
+    if (command === 'preflight') {
+      const result = await preflight(path.resolve(required(values, '--workspace')), required(values, '--repo'), controller.signal);
+      console.log(JSON.stringify(result)); return;
+    }
     if (command === 'smoke') {
       const directory = await smoke(path.resolve(required(values, '--workspace')), values.get('--repo'));
       output('action', 'SMOKE_COMPLETE'); output('report_path', directory); console.log(directory); return;
@@ -570,7 +620,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       output('action', 'CAPTURED'); if (result.reportPath) output('report_path', result.reportPath);
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected smoke, run-block, freeze, or status command');
+    throw new Error('Expected preflight, smoke, run-block, freeze, or status command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }

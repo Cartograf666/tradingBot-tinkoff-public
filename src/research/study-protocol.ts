@@ -19,6 +19,7 @@ export const studyProtocol = {
   source: 'exchange', session: 'main', tickers: STUDY_TICKERS, depth: 20,
   budgetRub: 4_000, commissionRate: 0.0005,
   smokeDurationSeconds: 60,
+  automaticBlockCheck: { session: 'main', requiredBeforeChunks: true, failure: 'abort-block', includedInReplay: false },
   chunkMaxSeconds: STUDY_CHUNK_MAX_MS / 1_000,
   chunkEndMarginSeconds: STUDY_CHUNK_END_MARGIN_MS / 1_000,
   segmentMaxBytes: 32 * 1024 * 1024,

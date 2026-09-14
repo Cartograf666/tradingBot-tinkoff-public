@@ -7,6 +7,8 @@ import {
 test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(STUDY_PROTOCOL_HASH, hashStudyValue(studyProtocol));
   assert.equal(studyProtocol.campaignEnabledByDefault, false);
+  assert.deepEqual(studyProtocol.automaticBlockCheck,
+    { session: 'main', requiredBeforeChunks: true, failure: 'abort-block', includedInReplay: false });
   assert.deepEqual(studyProtocol.tickers, ['SBER', 'GAZP', 'MAGN', 'VKCO', 'SMLT', 'AFKS']);
   assert.equal(studyProtocol.blocks.early.owns, '[API main start, 14:00 Europe/Moscow)');
   assert.equal(studyProtocol.blocks.late.owns, '[14:00 Europe/Moscow, API main end)');

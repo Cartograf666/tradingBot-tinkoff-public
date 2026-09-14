@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, ensureStateBranch, ledgerReadme, waitUntil } from './market-study.js';
+import { assessStudyChunk, ensureStateBranch, ledgerReadme, runAfterBlockCheck, waitUntil } from './market-study.js';
 import { createStudyLedger, type StudyDayReceipt } from '../research/study-state.js';
 
 function http(status: number): Error & { stderr: Buffer } {
@@ -65,6 +65,44 @@ test('a failed previous chunk cannot make the next capture start before its fixe
   const controller = new AbortController(), started = Date.now();
   await waitUntil(started + 20, controller.signal);
   assert.ok(Date.now() >= started + 15);
+});
+
+test('automatic block capture waits for session start AND the completed smoke/archive check', async () => {
+  const calls: string[] = [], notBefore = Date.now() + 20;
+  let releaseProbe!: () => void, notifyProbe!: () => void;
+  const probeStarted = new Promise<void>(resolve => { notifyProbe = resolve; });
+  const checkComplete = new Promise<void>(resolve => { releaseProbe = resolve; });
+  const work = runAfterBlockCheck(notBefore, new AbortController().signal, async () => {
+    assert.ok(Date.now() >= notBefore);
+    calls.push('probe'); notifyProbe();
+    await checkComplete; calls.push('archive-confirmed');
+  }, async () => { calls.push('capture'); return 7; });
+  await probeStarted;
+  assert.deepEqual(calls, ['probe']);
+  releaseProbe();
+  assert.equal(await work, 7);
+  assert.deepEqual(calls, ['probe', 'archive-confirmed', 'capture']);
+});
+
+test('failed quality, replay or archive check prevents all canonical collection', async () => {
+  for (const stage of ['quality', 'replay', 'archive']) {
+    let captured = false;
+    await assert.rejects(runAfterBlockCheck(Date.now(), new AbortController().signal,
+      async () => { throw new Error(stage); }, async () => { captured = true; }), new RegExp(stage));
+    assert.equal(captured, false);
+  }
+});
+
+test('cancel before or during automatic smoke cannot continue to canonical collection', async () => {
+  for (const abortBefore of [true, false]) {
+    const controller = new AbortController();
+    let probed = false, captured = false;
+    if (abortBefore) controller.abort();
+    await assert.rejects(runAfterBlockCheck(Date.now(), controller.signal,
+      async () => { probed = true; controller.abort(); }, async () => { captured = true; }), /abort/i);
+    assert.equal(probed, !abortBefore);
+    assert.equal(captured, false);
+  }
 });
 
 test('README performance aggregate excludes finalized days that failed the quality gate', () => {
