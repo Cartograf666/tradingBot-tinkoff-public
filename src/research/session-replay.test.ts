@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -8,6 +9,7 @@ import { consumeSessionChunks, inspectReplayChunk, validateSessionChunks, Sessio
 import { OrderBookSimulator, defaultSimulationConfig } from './order-book-simulator.js';
 import type { ObservationManifest } from './market-observation.js';
 import type { RecordedEvent } from './market-recording.js';
+import { archiveDiagnosticRecording } from '../report/market-study.js';
 
 const start = Date.parse('2026-09-14T06:00:00Z');
 const iso = (ms: number) => new Date(start + ms).toISOString();
@@ -40,6 +42,35 @@ function writeChunk(root: string, id: string, input: Frame[], clockJump = false)
   return directory;
 }
 const setup = (t: TestContext) => { const root = mkdtempSync(path.join(tmpdir(), 'session-replay-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; };
+
+test('diagnostic finalization archives real replay beside immutable raw files', async t => {
+  const root = setup(t), directory = writeChunk(root, 'diagnostic', [...frames(0), ['response', 100, book(100)], ['tick', 1000], ['stop', 2000]]);
+  writeFileSync(path.join(directory, 'summary.json'), '{}');
+  const rawBefore = readFileSync(path.join(directory, 'events.ndjson'));
+  const manifestBefore = readFileSync(path.join(directory, 'manifest.json'));
+  const result = await archiveDiagnosticRecording(directory, start + 20_000);
+  assert.equal(result.status, 'COMPLETE'); assert.equal(result.replayFailed, false);
+  assert.deepEqual(readFileSync(path.join(directory, 'events.ndjson')), rawBefore);
+  assert.deepEqual(readFileSync(path.join(directory, 'manifest.json')), manifestBefore);
+  assert.equal(existsSync(path.join(directory, 'replay')), false);
+  const entries = execFileSync('tar', ['-tzf', result.archive], { encoding: 'utf8' });
+  assert.match(entries, /diagnostic\/events\.ndjson/);
+  assert.match(entries, /diagnostic-replay\/replay\.json/);
+  const receipt = JSON.parse(execFileSync('tar', ['-xOzf', result.archive, 'diagnostic/diagnostic-observation.json'], { encoding: 'utf8' }));
+  assert.equal(receipt.replayFailed, false); assert.equal(receipt.counted, false);
+  assert.equal(receipt.replayDirectory, 'diagnostic-replay');
+});
+
+test('diagnostic replay integrity failure preserves raw archive and remains a failure', async t => {
+  const root = setup(t), directory = writeChunk(root, 'damaged', [...frames(0), ['stop', 2000]]);
+  writeFileSync(path.join(directory, 'summary.json'), '{}');
+  writeFileSync(path.join(directory, 'events.ndjson'), 'corrupt');
+  const result = await archiveDiagnosticRecording(directory, start + 20_000);
+  assert.equal(result.replayFailed, true);
+  assert.equal(execFileSync('tar', ['-xOzf', result.archive, 'damaged/events.ndjson'], { encoding: 'utf8' }), 'corrupt');
+  const receipt = JSON.parse(execFileSync('tar', ['-xOzf', result.archive, 'damaged/diagnostic-observation.json'], { encoding: 'utf8' }));
+  assert.equal(receipt.failureStage, 'replay'); assert.equal(receipt.counted, false);
+});
 
 test('a position bought in chunk A closes in B with one capital and nonzero exit latency', async t => {
   const root = setup(t);

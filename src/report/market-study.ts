@@ -345,9 +345,13 @@ function readManifestIdentity(directory: string): { runId: string; manifestHash:
   if (typeof manifest.runId !== 'string' || typeof recording?.sha256 !== 'string') throw new Error('Completed chunk identity is missing');
   return { runId: manifest.runId, manifestHash: createHash('sha256').update(bytes).digest('hex'), recordingHash: recording.sha256 };
 }
-async function archiveChunk(directory: string, name: string): Promise<string> {
+async function archiveChunk(directory: string, name: string, companion?: string): Promise<string> {
   const archive = path.join(path.dirname(directory), name);
-  await runFile('tar', ['-czf', archive, '-C', path.dirname(directory), path.basename(directory)]);
+  if (companion && path.dirname(path.resolve(companion)) !== path.dirname(path.resolve(directory))) {
+    throw new Error('Archive companion must be beside the recording');
+  }
+  await runFile('tar', ['-czf', archive, '-C', path.dirname(directory), path.basename(directory),
+    ...(companion ? [path.basename(companion)] : [])]);
   return archive;
 }
 export async function waitUntil(when: number, signal: AbortSignal): Promise<void> {
@@ -656,6 +660,33 @@ export function diagnosticStopAt(nowMs: number, mainStart: string, mainEnd: stri
   return stop;
 }
 
+/** Preserve raw input and sibling replay output together without writing derived files into the recording. */
+export async function archiveDiagnosticRecording(directory: string, stopAt: number) {
+  const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
+  const replayDirectory = `${directory}-replay`;
+  let quality: ChunkQuality | null = null;
+  let replayFailed = false;
+  let processingStage = 'quality';
+  if (manifest.status === 'COMPLETE') {
+    try {
+      quality = assessStudyChunk(directory);
+      processingStage = 'replay';
+      await replayRecording(directory, replayDirectory);
+    } catch {
+      replayFailed = true;
+      console.error(JSON.stringify({ stage: `diagnostic-${processingStage}`, reason: 'PROCESSING_FAILED' }));
+    }
+  }
+  const companion = existsSync(replayDirectory) ? replayDirectory : undefined;
+  atomicJson(path.join(directory, 'diagnostic-observation.json'), { schemaVersion: 1, diagnosticOnly: true, counted: false,
+    protocolHash: STUDY_PROTOCOL_HASH, status: manifest.status, quality, replayFailed, stopAt: new Date(stopAt).toISOString(),
+    replayDirectory: companion ? path.basename(companion) : null,
+    failureStage: replayFailed ? processingStage : null,
+    replayScope: 'Each diagnostic part is replayed independently; not a full study day.' });
+  const archive = await archiveChunk(directory, `diagnostic-${String(manifest.runId)}.tar.gz`, companion);
+  return { archive, status: manifest.status, quality, replayFailed };
+}
+
 /** Collect the remaining morning independently of the full-day ledger. */
 async function observeMorning(workspace: string, repository: string, signal: AbortSignal) {
   const discovery = await discoverStudyMarket(signal), now = Date.now();
@@ -671,24 +702,12 @@ async function observeMorning(workspace: string, repository: string, signal: Abo
     signal.throwIfAborted();
     const seconds = Math.min(1_800, Math.floor((stopAt - Date.now() - 1_000) / 1_000));
     const directory = await recordMarket({ ...recorderArguments(workspace, seconds, 'main'), captureDeadlineMs: stopAt }, process.cwd());
-    const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
-    let quality: ChunkQuality | null = null;
-    let replayFailed = false;
-    if (manifest.status === 'COMPLETE') {
-      try {
-        quality = assessStudyChunk(directory);
-        await replayRecording(directory, path.join(directory, 'replay'));
-      } catch { replayFailed = true; }
-    }
-    atomicJson(path.join(directory, 'diagnostic-observation.json'), { schemaVersion: 1, diagnosticOnly: true, counted: false,
-      protocolHash: STUDY_PROTOCOL_HASH, status: manifest.status, quality, replayFailed, stopAt: new Date(stopAt).toISOString(),
-      replayScope: 'Each diagnostic part is replayed independently; not a full study day.' });
-    const archive = await archiveChunk(directory, `diagnostic-${String(manifest.runId)}.tar.gz`);
-    await uploadConfirmedAsset(repository, archive);
+    const result = await archiveDiagnosticRecording(directory, stopAt);
+    await uploadConfirmedAsset(repository, result.archive);
     uploaded += 1;
     console.log(JSON.stringify({ action: 'DIAGNOSTIC_PART_CONFIRMED', parts: uploaded, counted: false }));
-    if (manifest.status !== 'COMPLETE') throw new Error('Diagnostic recording failed; partial archive preserved');
-    if (replayFailed) throw new Error('Diagnostic replay failed; raw archive preserved');
+    if (result.status !== 'COMPLETE') throw new Error('Diagnostic recording failed; partial archive preserved');
+    if (result.replayFailed) throw new Error('Diagnostic replay failed; raw archive preserved');
   }
   return { action: 'DIAGNOSTIC_COMPLETE', parts: uploaded, stopAt: new Date(stopAt).toISOString(), counted: false };
 }
