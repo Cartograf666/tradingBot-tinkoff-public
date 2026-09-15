@@ -624,7 +624,16 @@ async function smoke(workspace: string, repository?: string, captureDeadlineMs?:
   const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
   if (manifest.status !== 'COMPLETE') throw new Error('Smoke capture did not complete');
   const quality = assessStudyChunk(directory);
-  if (quality.status !== 'PASS') throw new Error('Smoke capture failed the collector quality gate');
+  if (quality.status !== 'PASS') {
+    atomicJson(path.join(directory, 'study-smoke.json'), { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH,
+      diagnosticOnly: true, counted: false, status: manifest.status, quality, replayStatus: 'NOT_RUN', completedAt: new Date().toISOString() });
+    console.error(JSON.stringify({ stage: 'smoke-quality', ...quality }));
+    if (repository) {
+      const identity = readManifestIdentity(directory);
+      await uploadConfirmedAsset(repository, await archiveChunk(directory, `smoke-${identity.runId}.tar.gz`));
+    }
+    throw new Error('Smoke capture failed the collector quality gate; diagnostic evidence preserved');
+  }
   const replayOutput = `${directory}-replay`;
   const replay = await replayRecording(directory, replayOutput);
   atomicJson(path.join(directory, 'study-smoke.json'), { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH,
