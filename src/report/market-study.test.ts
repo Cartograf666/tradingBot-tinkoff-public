@@ -3,13 +3,32 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, ensureStateBranch, findDraftRelease, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, studyBlockRecorded, studyChunkRecorded, waitUntil } from './market-study.js';
+import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, studyBlockRecorded, studyChunkRecorded, waitUntil } from './market-study.js';
+import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
 
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('diagnostic morning capture is finite, stops before afternoon preparation and requires an open session', () => {
+  const start = '2026-09-15T06:00:00Z', end = '2026-09-15T15:54:59Z';
+  assert.equal(diagnosticStopAt(Date.parse('2026-09-15T08:17:00Z'), start, end), Date.parse('2026-09-15T10:50:00Z'));
+  assert.equal(diagnosticStopAt(Date.parse('2026-09-15T08:17:00Z'), start, '2026-09-15T09:00:00Z'), Date.parse('2026-09-15T09:00:00Z'));
+  for (const now of ['2026-09-15T05:59:00Z', '2026-09-15T10:49:00Z', '2026-09-15T10:50:00Z', '2026-09-15T16:00:00Z']) {
+    assert.throws(() => diagnosticStopAt(Date.parse(now), start, end));
+  }
+});
+
+test('metadata preparation cannot push the market stream past its absolute deadline', () => {
+  assert.equal(boundedCaptureDuration(1_800_000, 1_000), 1_800_000);
+  assert.equal(boundedCaptureDuration(1_800_000, 5_000, 65_000), 60_000);
+  assert.equal(boundedCaptureDuration(60_000, 5_000, 200_000), 60_000);
+  assert.throws(() => boundedCaptureDuration(60_000, 65_000, 65_000));
+  assert.throws(() => boundedCaptureDuration(60_000, 66_000, 65_000));
+  assert.throws(() => boundedCaptureDuration(60_000, 1_000, NaN));
+});
 
 test('archive lookup finds an authenticated draft beyond the first release page without by-tag lookup', async () => {
   const calls: string[][] = [];
@@ -197,6 +216,7 @@ test('every retry schedule and manual capture map to the same block and concurre
     assert.equal(evaluate(blockExpression, 'workflow_dispatch', '', 'campaign', block), block);
   }
   assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'smoke', 'early'), 'smoke');
+  assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'observe', 'early'), 'observe');
 });
 
 test('prepared capture cannot run after preparation fails or is cancelled, while regular capture tolerates skipped preparation', () => {

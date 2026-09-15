@@ -619,8 +619,8 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
   });
 }
 
-async function smoke(workspace: string, repository?: string): Promise<string> {
-  const directory = await recordMarket(recorderArguments(workspace, 60, 'main'), process.cwd());
+async function smoke(workspace: string, repository?: string, captureDeadlineMs?: number): Promise<string> {
+  const directory = await recordMarket({ ...recorderArguments(workspace, 60, 'main'), captureDeadlineMs }, process.cwd());
   const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
   if (manifest.status !== 'COMPLETE') throw new Error('Smoke capture did not complete');
   const quality = assessStudyChunk(directory);
@@ -636,6 +636,52 @@ async function smoke(workspace: string, repository?: string): Promise<string> {
     await uploadConfirmedAsset(repository, archive);
   }
   return replayOutput;
+}
+
+export function diagnosticStopAt(nowMs: number, mainStart: string, mainEnd: string): number {
+  const start = Date.parse(mainStart), end = Date.parse(mainEnd);
+  if (![nowMs, start, end].every(Number.isFinite) || nowMs < start || nowMs >= end) throw new Error('Diagnostic capture requires an open main session');
+  const date = new Date(nowMs + 3 * 3_600_000).toISOString().slice(0, 10);
+  const stop = Math.min(Date.parse(`${date}T13:50:00+03:00`), end, nowMs + 340 * 60_000);
+  if (stop - nowMs < 120_000) throw new Error('Diagnostic capture needs at least two minutes before the afternoon preparation');
+  return stop;
+}
+
+/** Collect the remaining morning independently of the full-day ledger. */
+async function observeMorning(workspace: string, repository: string, signal: AbortSignal) {
+  const discovery = await discoverStudyMarket(signal), now = Date.now();
+  const window = nextMainSessionWindow(discovery.instruments, discovery.intervals, now, 60_000);
+  if (!window) throw new Error('No open main session');
+  const stopAt = diagnosticStopAt(now, window.start, window.end);
+  console.log(JSON.stringify({ action: 'DIAGNOSTIC_STARTING', stopAt: new Date(stopAt).toISOString(), counted: false }));
+  await smoke(workspace, repository, stopAt);
+  signal.throwIfAborted();
+  console.log('Diagnostic startup passed: market quality, replay and private archive confirmed.');
+  let uploaded = 0;
+  while (stopAt - Date.now() >= 120_000) {
+    signal.throwIfAborted();
+    const seconds = Math.min(1_800, Math.floor((stopAt - Date.now() - 1_000) / 1_000));
+    const directory = await recordMarket({ ...recorderArguments(workspace, seconds, 'main'), captureDeadlineMs: stopAt }, process.cwd());
+    const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
+    let quality: ChunkQuality | null = null;
+    let replayFailed = false;
+    if (manifest.status === 'COMPLETE') {
+      try {
+        quality = assessStudyChunk(directory);
+        await replayRecording(directory, path.join(directory, 'replay'));
+      } catch { replayFailed = true; }
+    }
+    atomicJson(path.join(directory, 'diagnostic-observation.json'), { schemaVersion: 1, diagnosticOnly: true, counted: false,
+      protocolHash: STUDY_PROTOCOL_HASH, status: manifest.status, quality, replayFailed, stopAt: new Date(stopAt).toISOString(),
+      replayScope: 'Each diagnostic part is replayed independently; not a full study day.' });
+    const archive = await archiveChunk(directory, `diagnostic-${String(manifest.runId)}.tar.gz`);
+    await uploadConfirmedAsset(repository, archive);
+    uploaded += 1;
+    console.log(JSON.stringify({ action: 'DIAGNOSTIC_PART_CONFIRMED', parts: uploaded, counted: false }));
+    if (manifest.status !== 'COMPLETE') throw new Error('Diagnostic recording failed; partial archive preserved');
+    if (replayFailed) throw new Error('Diagnostic replay failed; raw archive preserved');
+  }
+  return { action: 'DIAGNOSTIC_COMPLETE', parts: uploaded, stopAt: new Date(stopAt).toISOString(), counted: false };
 }
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -661,6 +707,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const directory = await smoke(path.resolve(required(values, '--workspace')), values.get('--repo'));
       output('action', 'SMOKE_COMPLETE'); output('report_path', directory); console.log(directory); return;
     }
+    if (command === 'observe') {
+      const result = await observeMorning(path.resolve(required(values, '--workspace')), required(values, '--repo'), controller.signal);
+      output('action', result.action); console.log(JSON.stringify(result)); return;
+    }
     const repository = required(values, '--repo');
     if (command === 'status') {
       const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
@@ -684,7 +734,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected prepare-block, preflight, smoke, run-block, freeze, or status command');
+    throw new Error('Expected prepare-block, preflight, smoke, observe, run-block, freeze, or status command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }

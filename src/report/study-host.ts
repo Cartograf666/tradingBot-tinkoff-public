@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export type StudyOperation = 'campaign' | 'preflight' | 'smoke' | 'freeze' | 'status';
+export type StudyOperation = 'campaign' | 'preflight' | 'smoke' | 'observe' | 'freeze' | 'status';
 class StudyHostError extends Error {}
 const repositoryName = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
@@ -30,7 +30,7 @@ export function resolveStudyHost(environment: NodeJS.ProcessEnv, operation: Stud
   const defaultBranch = environment.STUDY_DEFAULT_BRANCH;
   if (!defaultBranch || environment.GITHUB_REF !== `refs/heads/${defaultBranch}`) throw new StudyHostError('Study secrets may be used only on the default branch');
   if (!environment.MARKET_STUDY_STORAGE_TOKEN?.trim()) throw new StudyHostError('Set MARKET_STUDY_STORAGE_TOKEN for the private data repository');
-  if (operation === 'preflight' || operation === 'smoke' || operation === 'campaign') {
+  if (operation === 'preflight' || operation === 'smoke' || operation === 'observe' || operation === 'campaign') {
     if (!environment.TINKOFF_API_TOKEN_SANDBOX?.trim()) throw new StudyHostError('Set TINKOFF_API_TOKEN_SANDBOX for sandbox observation');
   }
   if (operation === 'campaign' && environment.MARKET_STUDY_ENABLED !== 'true') throw new StudyHostError('Market study capture is paused');
@@ -47,7 +47,7 @@ export async function verifyPrivateStudyTarget(target: string,
 
 async function main() {
   const operation = process.argv[2];
-  if (!['campaign', 'preflight', 'smoke', 'freeze', 'status'].includes(operation)) throw new StudyHostError('Unknown study operation');
+  if (!['campaign', 'preflight', 'smoke', 'observe', 'freeze', 'status'].includes(operation)) throw new StudyHostError('Unknown study operation');
   const target = resolveStudyHost(process.env, operation as StudyOperation);
   await verifyPrivateStudyTarget(target, repository => new Promise((resolve, reject) => {
     execFile('gh', ['api', `/repos/${repository}`], { encoding: 'utf8', maxBuffer: 1024 * 1024,

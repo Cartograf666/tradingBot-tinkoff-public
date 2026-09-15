@@ -17,6 +17,15 @@ export interface RecorderArguments {
   seconds: number; tickers: string[]; source: RequestedSource; depth: number;
   budgetRub: number; commissionRate: number; outputDir: string; maxBytes: number;
   segmentMaxBytes?: number; session?: 'any' | 'main';
+  captureDeadlineMs?: number;
+}
+
+export function boundedCaptureDuration(requestedMs: number, nowMs: number, deadlineMs?: number): number {
+  if (!Number.isFinite(requestedMs) || requestedMs <= 0 || !Number.isFinite(nowMs)
+    || (deadlineMs !== undefined && !Number.isFinite(deadlineMs))) throw new Error('Invalid capture deadline');
+  const duration = Math.min(requestedMs, deadlineMs === undefined ? requestedMs : deadlineMs - nowMs);
+  if (duration <= 0) throw new Error('Capture deadline has passed');
+  return duration;
 }
 export function parseRecorderArguments(args: string[], root: string): RecorderArguments {
   const values = new Map<string, string>();
@@ -124,6 +133,8 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
         return directory;
       }
     }
+    manifest.settings.durationMs = boundedCaptureDuration(manifest.settings.durationMs, Date.now(), args.captureDeadlineMs);
+    if (args.captureDeadlineMs !== undefined) manifest.notes.push(`Absolute capture deadline: ${new Date(args.captureDeadlineMs).toISOString()}`);
     manifest.status = 'RECORDING'; writeJson(manifestFile, manifest);
     stage = 'stream';
     writer = new RecordingWriter({ path: path.join(directory, 'events.ndjson'), runId, maxBytes: args.maxBytes,
