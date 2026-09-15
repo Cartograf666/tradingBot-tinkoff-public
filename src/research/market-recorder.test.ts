@@ -28,6 +28,26 @@ function eventsRecorder(events: CapturedEvent[]) {
   };
 }
 
+test('fractional monotonic start preserves the final tick at the exact capture boundary', async (t) => {
+  const startedAt = 200.001;
+  let now = startedAt, frames = 0;
+  t.mock.method(performance, 'now', () => now);
+  const events: CapturedEvent[] = [];
+  const result = await captureMarketStream({
+    openStream: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => {
+      now = startedAt + (++frames) * 1000;
+      return { done: false, value: {} };
+    } }) }),
+    record: eventsRecorder(events), expectedSubscriptions: [], acknowledgments: () => [],
+    durationMs: 60_000, tickIntervalMs: 1000, heartbeatTimeoutMs: 5000, maxReconnects: 0,
+  });
+  assert.equal(result.reason, 'duration');
+  assert.equal(result.ticks, 60);
+  assert.deepEqual(events.filter(event => event.kind === 'tick').map(event => event.payload),
+    Array.from({ length: 60 }, (_, index) => ({ elapsedMs: (index + 1) * 1000, skippedIntervals: 0 })));
+  assert.equal(events.at(-1)?.kind, 'stop');
+});
+
 test('subscription timeout aborts its epoch and reconnects until acknowledgments complete', async () => {
   const events: CapturedEvent[] = [];
   let opens = 0;

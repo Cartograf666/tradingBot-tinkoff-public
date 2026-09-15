@@ -136,6 +136,7 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
 
   const startedAt = performance.now();
   const deadline = startedAt + durationMs;
+  let nextTickIndex = 1;
   let nextTickAt = startedAt + tickIntervalMs;
   let currentController: AbortController | null = null;
   let currentEpoch = 0;
@@ -161,7 +162,9 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
   const emitDueTicks = (now: number): void => {
     if (nextTickAt > now || nextTickAt > deadline) return;
     const skippedIntervals = Math.max(0, Math.floor((now - nextTickAt) / tickIntervalMs));
-    nextTickAt += (skippedIntervals + 1) * tickIntervalMs;
+    nextTickIndex += skippedIntervals + 1;
+    // Anchor every deadline: repeated floating-point addition can put the last tick beyond the capture end.
+    nextTickAt = startedAt + nextTickIndex * tickIntervalMs;
     record('tick', { elapsedMs: Math.max(0, Math.round(now - startedAt)), skippedIntervals });
     ticks += 1;
   };
