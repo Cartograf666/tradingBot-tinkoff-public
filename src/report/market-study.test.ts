@@ -179,7 +179,7 @@ test('retry skips only confirmed canonical chunks with the same date, block and 
 test('every retry schedule and manual capture map to the same block and concurrency group', () => {
   const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
   const groupExpression = /group: market-study-\$\{\{ (.*?) \}\}/.exec(workflow)![1];
-  const blockExpression = /STUDY_BLOCK: \$\{\{ (.*?) \}\}/.exec(workflow)![1];
+  const blockExpression = /STUDY_BLOCK: \$\{\{ (.*?) \}\}/.exec(workflow.split('  campaign:')[1])![1];
   // These workflow expressions use only JS-compatible property access, ==, && and ||.
   const evaluate = (expression: string, event: string, schedule: string, mode: string, block: string) =>
     Function('github', 'inputs', `return (${expression});`)({ event_name: event, event: { schedule } }, { mode, block });
@@ -193,9 +193,27 @@ test('every retry schedule and manual capture map to the same block and concurre
   }
   for (const block of ['early', 'late']) {
     assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'campaign', block), block);
+    assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'arm', block), block);
     assert.equal(evaluate(blockExpression, 'workflow_dispatch', '', 'campaign', block), block);
   }
   assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'smoke', 'early'), 'smoke');
+});
+
+test('prepared capture cannot run after preparation fails or is cancelled, while regular capture tolerates skipped preparation', () => {
+  const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
+  const expression = /  campaign:\n    needs: prepare\n    if: >-\n([\s\S]*?)    runs-on:/.exec(workflow)![1].trim();
+  const evaluate = (event: string, mode: string, result: string, cancelled: boolean, enabled = 'true', trusted = true) =>
+    Function('github', 'inputs', 'needs', 'vars', 'cancelled', 'format', `return (${expression});`)(
+      { event_name: event, event: { repository: { private: false, default_branch: 'main' } }, ref: trusted ? 'refs/heads/main' : 'refs/pull/1/merge' },
+      { mode }, { prepare: { result } }, { MARKET_STUDY_ENABLED: enabled }, () => cancelled, (_: string, value: string) => `refs/heads/${value}`);
+  assert.equal(evaluate('schedule', '', 'skipped', false), true);
+  assert.equal(evaluate('workflow_dispatch', 'campaign', 'skipped', false), true);
+  assert.equal(evaluate('workflow_dispatch', 'arm', 'success', false), true);
+  for (const result of ['failure', 'cancelled', 'skipped']) assert.equal(evaluate('workflow_dispatch', 'arm', result, false), false);
+  assert.equal(evaluate('workflow_dispatch', 'arm', 'success', true), false);
+  assert.equal(evaluate('workflow_dispatch', 'arm', 'success', false, 'false'), false);
+  assert.equal(evaluate('workflow_dispatch', 'arm', 'success', false, 'true', false), false);
+  assert.doesNotMatch(workflow.split('  prepare:')[1].split('  campaign:')[0], /secrets\./);
 });
 
 test('workflow keeps schedules activation-gated and action versions immutable', () => {

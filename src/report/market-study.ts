@@ -11,7 +11,7 @@ import { replayConfigHash, replayRecording, replaySession, replaySourceHashes } 
 import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import {
-  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock,
+  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
@@ -643,6 +643,16 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const controller = new AbortController(), stop = () => controller.abort();
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   try {
+    if (command === 'prepare-block') {
+      const block = required(values, '--block');
+      const preparation = planStudyPreparation(block as StudyBlock, Date.now());
+      console.log(JSON.stringify({ action: 'WAITING_FOR_BLOCK', block, ...preparation }));
+      await waitUntil(Date.parse(preparation.readyAt), controller.signal);
+      controller.signal.throwIfAborted();
+      assertStudyPreparationReady(preparation, Date.now());
+      console.log(JSON.stringify({ action: 'PREPARATION_COMPLETE', block, ...preparation }));
+      return;
+    }
     if (command === 'preflight') {
       const result = await preflight(path.resolve(required(values, '--workspace')), required(values, '--repo'), controller.signal);
       console.log(JSON.stringify(result)); return;
@@ -674,7 +684,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected preflight, smoke, run-block, freeze, or status command');
+    throw new Error('Expected prepare-block, preflight, smoke, run-block, freeze, or status command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }

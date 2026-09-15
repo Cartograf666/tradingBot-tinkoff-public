@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  STUDY_PROTOCOL_HASH, chunkDurationSeconds, hashStudyValue, planStudyBlock, studyProtocol,
+  STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation, studyProtocol,
 } from './study-protocol.js';
 
 test('protocol hash covers the paused full-session collection contract', () => {
@@ -13,6 +13,22 @@ test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(studyProtocol.blocks.early.owns, '[API main start, 14:00 Europe/Moscow)');
   assert.equal(studyProtocol.blocks.late.owns, '[14:00 Europe/Moscow, API main end)');
   assert.notEqual(hashStudyValue({ ...studyProtocol, depth: 10 }), STUDY_PROTOCOL_HASH);
+});
+
+test('armed preparation waits for today only within a bounded runner duration', () => {
+  assert.deepEqual(planStudyPreparation('late', Date.parse('2026-09-15T07:30:00Z')),
+    { sessionDate: '2026-09-15', readyAt: '2026-09-15T10:50:00.000Z' });
+  assert.deepEqual(planStudyPreparation('early', Date.parse('2026-09-15T05:00:00Z')),
+    { sessionDate: '2026-09-15', readyAt: '2026-09-15T05:50:00.000Z' });
+  assert.equal(planStudyPreparation('late', Date.parse('2026-09-15T10:49:59.999Z')).readyAt, '2026-09-15T10:50:00.000Z');
+  for (const now of ['2026-09-15T10:50:00Z', '2026-09-15T11:00:00Z', '2026-09-15T00:00:00Z', '2026-09-15T21:30:00Z', '2026-09-15T05:02:00Z']) {
+    assert.throws(() => planStudyPreparation('late', Date.parse(now)), /later today/);
+  }
+  assert.throws(() => planStudyPreparation('late', NaN));
+  const preparation = { sessionDate: '2026-09-15', readyAt: '2026-09-15T10:50:00.000Z' };
+  assert.doesNotThrow(() => assertStudyPreparationReady(preparation, Date.parse(preparation.readyAt)));
+  assert.throws(() => assertStudyPreparationReady(preparation, Date.parse('2026-09-15T10:49:59Z')));
+  assert.throws(() => assertStudyPreparationReady(preparation, Date.parse('2026-09-15T21:00:00Z')));
 });
 
 test('fresh API session is split into two complete ownership blocks and <=30 minute chunks', () => {

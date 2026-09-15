@@ -14,9 +14,9 @@ on:
         type: choice
         required: true
         default: check
-        options: [check, preflight, smoke, campaign, freeze, status]
+        options: [check, preflight, smoke, campaign, arm, freeze, status]
       block:
-        description: 'Блок полной сессии (только campaign)'
+        description: 'Блок полной сессии (campaign или arm)'
         type: choice
         required: true
         default: early
@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: market-study-${{ github.event_name == 'schedule' && (github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.mode == 'campaign' && inputs.block || inputs.mode }}
+  group: market-study-${{ github.event_name == 'schedule' && (github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || (inputs.mode == 'campaign' || inputs.mode == 'arm') && inputs.block || inputs.mode }}
   cancel-in-progress: false
 
 env:
@@ -52,12 +52,38 @@ jobs:
       - name: Explain result
         run: echo 'Code checks passed. This operation collects no market data and needs no credentials.'
 
-  campaign:
+  prepare:
     if: >-
+      github.event_name == 'workflow_dispatch' && inputs.mode == 'arm' &&
+      github.event.repository.private == false &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      vars.MARKET_STUDY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '25.4.0'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npx tsc -p tsconfig.study.json
+      - name: Wait for today's block without broker or storage credentials
+        env:
+          STUDY_BLOCK: ${{ inputs.block }}
+        run: node .study-dist/src/report/market-study.js prepare-block --block "$STUDY_BLOCK"
+
+  campaign:
+    needs: prepare
+    if: >-
+      !cancelled() &&
       github.event.repository.private == false &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       ((github.event_name == 'schedule' && vars.MARKET_STUDY_ENABLED == 'true') ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'campaign' && vars.MARKET_STUDY_ENABLED == 'true'))
+      (github.event_name == 'workflow_dispatch' && (inputs.mode == 'campaign' || inputs.mode == 'arm') && vars.MARKET_STUDY_ENABLED == 'true')) &&
+      (inputs.mode != 'arm' || needs.prepare.result == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
