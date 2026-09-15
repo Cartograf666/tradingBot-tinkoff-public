@@ -10,8 +10,9 @@ import { recordMarket, type RecorderArguments } from './record-market.js';
 import { replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
 import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
+import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
 import {
-  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation,
+  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
@@ -253,6 +254,70 @@ export function assessStudyChunk(directory: string, bounds?: Pick<StudyChunkPlan
     }),
   };
   return { status: Object.values(checks).every(Boolean) ? 'PASS' : 'INSUFFICIENT_DATA', checks };
+}
+
+/** Only fixed labels, known tickers and validated counts may enter public diagnostics. */
+export function smokeQualityReasons(summary: JsonObject, quality: ChunkQuality): string[] {
+  const count = (value: unknown): number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const reasons: string[] = [];
+  const labels: Record<string, string> = {
+    complete: 'Запись не завершила полную минуту.', exchange: 'Не получены пригодные биржевые данные.',
+    subscriptions: 'Подтверждены не все 18 подписок.', plannedBounds: 'Запись вышла за границы заданного окна.',
+  };
+  for (const [key, label] of Object.entries(labels)) if (quality.checks[key] === false) reasons.push(label);
+  if (quality.checks.timerCoverage === false) {
+    const sampling = summary.samplingCoverage as JsonObject | undefined;
+    reasons.push(`Таймер: записано ${count(sampling?.recordedTicks)} из ${count(sampling?.expectedTicksFromElapsedTime)} отметок; требуется 99%.`);
+  }
+  if (quality.checks.instruments === false) {
+    const groups = Array.isArray(summary.groups) ? summary.groups as JsonObject[] : [];
+    for (const ticker of STUDY_TICKERS) {
+      const group = groups.find(item => item?.source === 'EXCHANGE' && item.ticker === ticker);
+      const phases = Array.isArray(group?.phases) ? group.phases as JsonObject[] : [];
+      const phase = phases.find(item => item?.phase === 'regular_trading_session_main');
+      const share = phase?.usableShareOfObservedScheduledTicks;
+      if (typeof share === 'number' && Number.isFinite(share) && share >= 0.8) continue;
+      const observed = count(phase?.observedScheduledTicks), usable = count(phase?.eligibleSamples);
+      reasons.push(observed ? `${ticker}: пригодно ${usable} из ${observed} секунд, требуется минимум ${Math.ceil(observed * 0.8)} (80%).`
+        : `${ticker}: нет пригодных данных основной сессии.`);
+    }
+  }
+  return reasons.length ? reasons : ['Проверка качества данных не пройдена.'];
+}
+
+const smokeStageLabels = {
+  recording: 'Не удалось завершить полную минуту записи. Проверьте доступ к песочнице и состояние подключения.',
+  quality: 'Не удалось проверить качество сохранённой записи.',
+  replay: 'Не удалось выполнить симуляцию по сохранённой записи.',
+  'private-archive': 'Не удалось подтвердить сохранение архива в приватном хранилище.',
+  unknown: 'Техническая ошибка стартовой проверки. Автоматические повторы остановлены.',
+} as const;
+
+export function renderSmokeCheckEvent(event: SmokeCheckEvent, privateArchive = true): string {
+  switch (event.type) {
+    case 'attempt': return `${event.attempt === 1 ? '### Проверка перед сбором\n\n' : ''}Проба **${event.attempt}/3**: запись одной минуты.`;
+    case 'quality-rejected': return `Проба **${event.attempt}/3** не прошла качество.\n\n${event.reasons.map(reason => `- ${reason}`).join('\n')}\n\n${privateArchive ? 'Диагностический архив сохранён приватно.' : 'Диагностика сохранена локально.'}`;
+    case 'retry': return `Следующая проба начнётся автоматически через ${event.delayMs / 1000} секунд. Пороги качества сохранены.`;
+    case 'passed': return `**Стартовая проверка пройдена с попытки ${event.attempt}/3.** Качество записи и выполнение симуляции подтверждены${privateArchive ? ', приватный архив проверен' : ''}. Это подтверждение старта; длительный сбор ещё не завершён.`;
+    case 'stopped': return `**Сбор не начат.** ${event.reason === 'QUALITY_RETRIES_EXHAUSTED' ? 'Все три пробы отклонены по качеству данных.' : 'До конца допустимого окна недостаточно времени для полной пробы.'} Требования к качеству не снижались.`;
+    case 'fatal': return `**Сбор не начат.** ${smokeStageLabels[event.stage]} Эта ошибка не повторяется автоматически.`;
+  }
+}
+
+function reportSmokeCheckEvent(event: SmokeCheckEvent, privateArchive: boolean): void {
+  const message = renderSmokeCheckEvent(event, privateArchive);
+  console.log(`Market study: ${message}`);
+  if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n\n`, { flag: 'a' });
+  if (event.type === 'stopped' || event.type === 'fatal') {
+    console.error(`::error title=Стартовая проверка::${event.type === 'fatal' ? smokeStageLabels[event.stage]
+      : event.reason === 'QUALITY_RETRIES_EXHAUSTED' ? 'Все три пробы не прошли качество. Сбор не начат; причины указаны в сводке запуска.'
+        : 'Истекло допустимое время стартовой проверки. Сбор не начат.'}`);
+  }
+}
+
+function checkedSmoke(workspace: string, repository: string | undefined, signal: AbortSignal, deadlineMs?: number): Promise<string> {
+  return runSmokeWithRetries(deadline => smoke(workspace, repository, deadline), { signal, deadlineMs,
+    onEvent: event => reportSmokeCheckEvent(event, Boolean(repository)) });
 }
 
 function recorderArguments(outputDir: string, seconds: number, session: 'main' | 'any'): RecorderArguments {
@@ -585,7 +650,8 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
   assertFrozenRuntime(persisted);
   return runAfterBlockCheck(Date.parse(plan.captureNotBefore), signal, async () => {
     console.log('Automatic block check: recording 60 seconds of exchange main-session data.');
-    await smoke(workspace, repository);
+    await checkedSmoke(workspace, repository, signal,
+      Math.min(Date.parse(plan.ownedStart) + STUDY_LAUNCH_LATENESS_MS, Date.parse(plan.ownedEnd)));
     console.log('Automatic block check passed: quality, replay and private archive confirmed.');
   }, async () => {
     let uploaded = 0;
@@ -624,30 +690,41 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
 }
 
 async function smoke(workspace: string, repository?: string, captureDeadlineMs?: number): Promise<string> {
-  const directory = await recordMarket({ ...recorderArguments(workspace, 60, 'main'), captureDeadlineMs }, process.cwd());
-  const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
-  if (manifest.status !== 'COMPLETE') throw new Error('Smoke capture did not complete');
-  const quality = assessStudyChunk(directory);
-  if (quality.status !== 'PASS') {
-    atomicJson(path.join(directory, 'study-smoke.json'), { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH,
-      diagnosticOnly: true, counted: false, status: manifest.status, quality, replayStatus: 'NOT_RUN', completedAt: new Date().toISOString() });
-    console.error(JSON.stringify({ stage: 'smoke-quality', ...quality }));
-    if (repository) {
-      const identity = readManifestIdentity(directory);
-      await uploadConfirmedAsset(repository, await archiveChunk(directory, `smoke-${identity.runId}.tar.gz`));
-    }
-    throw new Error('Smoke capture failed the collector quality gate; diagnostic evidence preserved');
-  }
+  let directory: string, manifest: JsonObject;
+  try {
+    directory = await recordMarket({ ...recorderArguments(workspace, 60, 'main'), captureDeadlineMs }, process.cwd());
+    manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
+  } catch { throw new StudyStageError('recording'); }
   const replayOutput = `${directory}-replay`;
-  const replay = await replayRecording(directory, replayOutput);
-  atomicJson(path.join(directory, 'study-smoke.json'), { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH,
-    diagnosticOnly: true, counted: false, status: manifest.status, quality, replayQuality: replay.quality,
-    replayConfigHash: replay.configHash, completedAt: new Date().toISOString() });
-  if (repository) {
-    const identity = readManifestIdentity(directory);
-    const archive = await archiveChunk(directory, `smoke-${identity.runId}.tar.gz`);
-    await uploadConfirmedAsset(repository, archive);
+  let quality: ChunkQuality | null = null, replay: Awaited<ReturnType<typeof replayRecording>> | null = null;
+  let failure: SmokeQualityError | StudyStageError | null = null;
+  try {
+    if (manifest.status !== 'COMPLETE' || (manifest.settings as JsonObject | undefined)?.durationMs !== 60_000) {
+      throw new StudyStageError('recording');
+    }
+    quality = assessStudyChunk(directory);
+    if (quality.status !== 'PASS') throw new SmokeQualityError(smokeQualityReasons(
+      JSON.parse(readFileSync(path.join(directory, 'summary.json'), 'utf8')) as JsonObject, quality));
+    try { replay = await replayRecording(directory, replayOutput); }
+    catch { throw new StudyStageError('replay'); }
+  } catch (error) {
+    failure = error instanceof SmokeQualityError || error instanceof StudyStageError ? error : new StudyStageError('quality');
   }
+  try {
+    atomicJson(path.join(directory, 'study-smoke.json'), { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH,
+      diagnosticOnly: true, counted: false, status: manifest.status, quality,
+      qualityReasons: failure instanceof SmokeQualityError ? failure.reasons : [],
+      failureStage: failure instanceof StudyStageError ? failure.stage : failure ? 'quality' : null,
+      replayStatus: replay ? 'COMPLETE' : failure instanceof StudyStageError && failure.stage === 'replay' ? 'FAILED' : 'NOT_RUN',
+      replayQuality: replay?.quality ?? null, replayConfigHash: replay?.configHash ?? null, completedAt: new Date().toISOString() });
+    if (repository) {
+      if (typeof manifest.runId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(manifest.runId)) {
+        throw new Error('Invalid smoke recording identity');
+      }
+      await uploadConfirmedAsset(repository, await archiveChunk(directory, `smoke-${manifest.runId}.tar.gz`));
+    }
+  } catch { throw new StudyStageError('private-archive'); }
+  if (failure) throw failure;
   return replayOutput;
 }
 
@@ -694,7 +771,7 @@ async function observeMorning(workspace: string, repository: string, signal: Abo
   if (!window) throw new Error('No open main session');
   const stopAt = diagnosticStopAt(now, window.start, window.end);
   console.log(JSON.stringify({ action: 'DIAGNOSTIC_STARTING', stopAt: new Date(stopAt).toISOString(), counted: false }));
-  await smoke(workspace, repository, stopAt);
+  await checkedSmoke(workspace, repository, signal, stopAt);
   signal.throwIfAborted();
   console.log('Diagnostic startup passed: market quality, replay and private archive confirmed.');
   let uploaded = 0;
@@ -732,7 +809,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       console.log(JSON.stringify(result)); return;
     }
     if (command === 'smoke') {
-      const directory = await smoke(path.resolve(required(values, '--workspace')), values.get('--repo'));
+      const directory = await checkedSmoke(path.resolve(required(values, '--workspace')), values.get('--repo'), controller.signal);
       output('action', 'SMOKE_COMPLETE'); output('report_path', directory); console.log(directory); return;
     }
     if (command === 'observe') {

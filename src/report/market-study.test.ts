@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, studyBlockRecorded, studyChunkRecorded, waitUntil } from './market-study.js';
+import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
@@ -11,6 +11,30 @@ import { planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('smoke summary explains the observed 47/60 failure without changing its 80% requirement', () => {
+  const summary = { groups: ['SBER', 'GAZP', 'MAGN', 'VKCO', 'SMLT', 'AFKS'].map(ticker => ({ ticker, source: 'EXCHANGE',
+    phases: [{ phase: 'regular_trading_session_main', observedScheduledTicks: 60,
+      eligibleSamples: ticker === 'VKCO' ? 47 : 60, usableShareOfObservedScheduledTicks: ticker === 'VKCO' ? 47 / 60 : 1 }] })) };
+  const reasons = smokeQualityReasons(summary, { status: 'INSUFFICIENT_DATA', checks: { instruments: false } });
+  assert.deepEqual(reasons, ['VKCO: пригодно 47 из 60 секунд, требуется минимум 48 (80%).']);
+  const markdown = renderSmokeCheckEvent({ type: 'quality-rejected', attempt: 1, reasons });
+  assert.match(markdown, /47 из 60/); assert.match(markdown, /архив сохранён приватно/);
+  assert.match(renderSmokeCheckEvent({ type: 'retry', attempt: 1, delayMs: 15_000 }), /через 15 секунд/);
+  assert.match(renderSmokeCheckEvent({ type: 'passed', attempt: 2 }), /длительный сбор ещё не завершён/);
+  assert.match(renderSmokeCheckEvent({ type: 'stopped', attempt: 3, reason: 'QUALITY_RETRIES_EXHAUSTED' }), /Сбор не начат/);
+  assert.match(renderSmokeCheckEvent({ type: 'fatal', attempt: 1, stage: 'private-archive' }), /не повторяется автоматически/);
+});
+
+test('public quality explanation includes no arbitrary payload, ticker, error or invalid numeric text', () => {
+  const hidden = 'secret-payload-::error';
+  const reasons = smokeQualityReasons({ samplingCoverage: { recordedTicks: hidden, expectedTicksFromElapsedTime: NaN },
+    groups: [{ source: 'EXCHANGE', ticker: hidden, phases: [{ phase: hidden, eligibleSamples: hidden }] }] },
+  { status: 'INSUFFICIENT_DATA', checks: { timerCoverage: false, instruments: false, [hidden]: false } });
+  const output = renderSmokeCheckEvent({ type: 'quality-rejected', attempt: 1, reasons });
+  assert.doesNotMatch(output, /secret-payload|NaN|Infinity/);
+  assert.match(output, /записано 0 из 0/); assert.match(output, /VKCO: нет пригодных данных/);
+});
 
 test('diagnostic morning capture is finite, stops before afternoon preparation and requires an open session', () => {
   const start = '2026-09-15T06:00:00Z', end = '2026-09-15T15:54:59Z';
