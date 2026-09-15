@@ -1,0 +1,22 @@
+name: Market study schedule delivery probe
+
+# Temporary, read-only validation of actual GitHub schedule delivery.
+# Remove after recording the result; it does not start the market collector.
+on:
+  schedule:
+    - cron: '30,35,40,45,50,55 7 15 9 *'
+
+permissions: {}
+
+jobs:
+  schedule-delivered:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Confirm scheduled event without credentials or market data
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          test "$EVENT_NAME" = schedule
+          echo "Scheduled event delivered: $EVENT_SCHEDULE"

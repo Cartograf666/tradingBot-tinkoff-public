@@ -1,9 +1,12 @@
 name: Market study (public compute, private data)
+run-name: Market study / ${{ github.event_name == 'schedule' && 'campaign' || inputs.mode }} / ${{ github.event_name == 'schedule' && (github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
 
 on:
   schedule:
-    - cron: '50 5 * * 1-5'
-    - cron: '50 10 * * 1-5'
+    - cron: '50,55 5 * * 1-5'
+    - cron: '0,5,10,15 6 * * 1-5'
+    - cron: '50,55 10 * * 1-5'
+    - cron: '0,5,10,15 11 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
@@ -23,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: market-study-${{ github.event_name == 'schedule' && github.event.schedule == '50 5 * * 1-5' && 'early' || github.event_name == 'schedule' && 'late' || inputs.mode == 'campaign' && inputs.block || inputs.mode }}
+  group: market-study-${{ github.event_name == 'schedule' && (github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.mode == 'campaign' && inputs.block || inputs.mode }}
   cancel-in-progress: false
 
 env:
@@ -75,7 +78,7 @@ jobs:
           TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
           GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: ${{ github.workspace }}/certs/russian-trusted-root-ca.pem
           MARKET_STUDY_ENABLED: ${{ vars.MARKET_STUDY_ENABLED }}
-          STUDY_BLOCK: ${{ github.event_name == 'schedule' && github.event.schedule == '50 5 * * 1-5' && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
+          STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
         run: |
           node .study-dist/src/report/study-host.js campaign
           node .study-dist/src/report/market-study.js run-block \

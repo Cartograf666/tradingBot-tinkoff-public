@@ -190,14 +190,12 @@ async function discoverStudyMarket(signal: AbortSignal) {
     closable.channel?.close();
   }
 }
-async function discoverBlockPlan(block: StudyBlock, signal: AbortSignal): Promise<StudyBlockPlan> {
+async function discoverBlockPlan(block: StudyBlock, signal: AbortSignal): Promise<StudyBlockPlan | null> {
   const discovery = await discoverStudyMarket(signal), now = Date.now();
   const moscowDate = new Date(now + 3 * 3_600_000).toISOString().slice(0, 10);
   const window = nextMainSessionWindow(discovery.instruments, discovery.intervals, dayStartUtc(moscowDate), 1);
-  if (!window) throw new Error('Fresh API calendar has no common main session');
-  const plan = planStudyBlock(moscowDate, window.start, window.end, block, now);
-  if (!plan) throw new Error('Current launch is outside the owned study block window');
-  return plan;
+  if (!window) return null;
+  return planStudyBlock(moscowDate, window.start, window.end, block, now);
 }
 
 /** Runs at any hour; proves sandbox authentication AND both private write paths.
@@ -549,16 +547,33 @@ export async function maybeFinalizeStudyDay(repository: string, plan: StudyBlock
   } finally { rmSync(materialized, { recursive: true, force: true }); }
 }
 
+export function studyBlockRecorded(ledger: StudyLedger, plan: StudyBlockPlan): boolean {
+  return plan.chunks.length > 0 && plan.chunks.every(planned => ledger.chunks.some(recorded =>
+    recorded.sessionDate === plan.sessionDate && recorded.block === plan.block
+    && recorded.chunkIndex === planned.index && recorded.plannedStart === planned.plannedStart
+    && recorded.plannedEnd === planned.plannedEnd
+    && ledger.canonicalChunks[`${plan.sessionDate}:${plan.block}:${planned.index}`] === recorded.assetId));
+}
+
+export function studyChunkRecorded(ledger: StudyLedger, plan: StudyBlockPlan, chunk: StudyChunkPlan): boolean {
+  return studyBlockRecorded(ledger, { ...plan, chunks: [chunk] });
+}
+
+type BlockResult = { action: 'CAPTURED'; plan: StudyBlockPlan; chunks: number; reportPath: string | null }
+  | { action: 'SKIPPED'; reason: string; chunks: 0; reportPath: string | null };
 export async function captureStudyBlock(repository: string, block: StudyBlock, workspace: string,
-  runId: string, runAttempt: number, signal: AbortSignal): Promise<{ plan: StudyBlockPlan; chunks: number; reportPath: string | null }> {
+  runId: string, runAttempt: number, signal: AbortSignal): Promise<BlockResult> {
   if (process.env.MARKET_STUDY_ENABLED !== 'true') throw new Error('Full-session campaign is paused pending storage configuration, sandbox smoke and activation');
+  const plan = await discoverBlockPlan(block, signal);
+  if (!plan) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
   mkdirSync(path.resolve(workspace), { recursive: true });
   await ensureDraftRelease(repository);
   const recovered = await reconcileReleaseAssets(repository);
-  const plan = await discoverBlockPlan(block, signal);
   const decision = planStudyRun(recovered, { event: 'schedule', campaignEnabled: true, runId, runAttempt,
     sessionDate: plan.sessionDate });
-  if (decision.action !== 'CAPTURE') throw new Error(`Study capture is unavailable: ${decision.action}`);
+  if (decision.action !== 'CAPTURE') return { action: 'SKIPPED', reason: decision.action, chunks: 0, reportPath: null };
+  if (studyBlockRecorded(recovered, plan)) return { action: 'SKIPPED', reason: 'BLOCK_ALREADY_RECORDED', chunks: 0,
+    reportPath: await maybeFinalizeStudyDay(repository, plan, workspace) };
   assertFrozenRuntime(recovered);
   const attemptId = `${runId}:${runAttempt}`;
   let persisted = await updateRemoteLedger(repository, ledger => beginStudyAttempt(ledger, { runId, runAttempt,
@@ -577,6 +592,7 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
       if (seconds <= 0) continue;
       persisted = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
       assertFrozenRuntime(persisted);
+      if (studyChunkRecorded(persisted, plan, chunk)) continue;
       const directory = await recordMarket(recorderArguments(workspace, seconds, 'main'), process.cwd());
       const quality = assessStudyChunk(directory, chunk), identity = readManifestIdentity(directory);
       const assetName = `study-${plan.sessionDate}-${block}-${String(chunk.index).padStart(2, '0')}-${runId}-${runAttempt}.tar.gz`;
@@ -599,7 +615,7 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
       uploaded += 1;
     }
     const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
-    return { plan, chunks: uploaded, reportPath };
+    return { action: 'CAPTURED' as const, plan, chunks: uploaded, reportPath };
   });
 }
 
@@ -649,7 +665,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const block = required(values, '--block'); if (!['early', 'late'].includes(block)) throw new Error('Invalid study block');
       const result = await captureStudyBlock(repository, block as StudyBlock, path.resolve(required(values, '--workspace')),
         required(values, '--run-id'), Number(required(values, '--run-attempt')), controller.signal);
-      output('action', 'CAPTURED'); if (result.reportPath) output('report_path', result.reportPath);
+      output('action', result.action); if (result.reportPath) output('report_path', result.reportPath);
+      if (process.env.GITHUB_STEP_SUMMARY) {
+        const summary = result.action === 'SKIPPED'
+          ? `### Сбор пропущен\n\nПричина: \`${result.reason}\`. Эта задача не создала новую попытку записи. Успех служебного запуска не означает собранный торговый день.\n`
+          : `### Блок записан\n\nПодтверждено новых частей: ${result.chunks}. Полнота дня оценивается отдельной проверкой данных.\n`;
+        writeFileSync(process.env.GITHUB_STEP_SUMMARY, summary, { flag: 'a' });
+      }
       console.log(JSON.stringify(result)); return;
     }
     throw new Error('Expected preflight, smoke, run-block, freeze, or status command');

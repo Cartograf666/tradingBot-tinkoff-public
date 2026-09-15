@@ -3,9 +3,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, ensureStateBranch, findDraftRelease, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, waitUntil } from './market-study.js';
-import { createStudyLedger, type StudyDayReceipt } from '../research/study-state.js';
-import { STUDY_RELEASE_TAG } from '../research/study-protocol.js';
+import { assessStudyChunk, ensureStateBranch, findDraftRelease, ledgerReadme, runAfterBlockCheck, sandboxDiscoveryFailure, studyBlockRecorded, studyChunkRecorded, waitUntil } from './market-study.js';
+import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
+import { planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
 
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
@@ -157,10 +157,50 @@ test('README performance aggregate excludes finalized days that failed the quali
   assert.doesNotMatch(markdown, /1000\.00/);
 });
 
+test('retry skips only confirmed canonical chunks with the same date, block and planned bounds', () => {
+  const plan = planStudyBlock('2026-09-15', '2026-09-15T06:00:00Z', '2026-09-15T15:54:59Z', 'early', Date.parse('2026-09-15T05:50:00Z'))!;
+  const ledger = createStudyLedger();
+  for (const chunk of plan.chunks) {
+    ledger.chunks.push({ assetId: chunk.index, sessionDate: plan.sessionDate, block: plan.block,
+      chunkIndex: chunk.index, plannedStart: chunk.plannedStart, plannedEnd: chunk.plannedEnd } as StudyChunkReceipt);
+    ledger.canonicalChunks[`${plan.sessionDate}:early:${chunk.index}`] = chunk.index;
+  }
+  assert.equal(studyBlockRecorded(ledger, plan), true);
+  delete ledger.canonicalChunks[`${plan.sessionDate}:early:2`];
+  assert.equal(studyBlockRecorded(ledger, plan), false);
+  assert.equal(studyChunkRecorded(ledger, plan, plan.chunks[0]), true);
+  assert.equal(studyChunkRecorded(ledger, plan, plan.chunks[1]), false);
+  assert.equal(studyBlockRecorded(ledger, { ...plan, sessionDate: '2026-09-16' }), false);
+  assert.equal(studyBlockRecorded(ledger, { ...plan, block: 'late' }), false);
+  ledger.chunks[0].plannedStart = '2026-09-15T06:00:01Z';
+  assert.equal(studyChunkRecorded(ledger, plan, plan.chunks[0]), false);
+});
+
+test('every retry schedule and manual capture map to the same block and concurrency group', () => {
+  const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
+  const groupExpression = /group: market-study-\$\{\{ (.*?) \}\}/.exec(workflow)![1];
+  const blockExpression = /STUDY_BLOCK: \$\{\{ (.*?) \}\}/.exec(workflow)![1];
+  // These workflow expressions use only JS-compatible property access, ==, && and ||.
+  const evaluate = (expression: string, event: string, schedule: string, mode: string, block: string) =>
+    Function('github', 'inputs', `return (${expression});`)({ event_name: event, event: { schedule } }, { mode, block });
+  for (const [schedule, block] of [
+    ['50,55 5 * * 1-5', 'early'], ['0,5,10,15 6 * * 1-5', 'early'],
+    ['50,55 10 * * 1-5', 'late'], ['0,5,10,15 11 * * 1-5', 'late'],
+  ]) {
+    assert.ok(workflow.includes(`cron: '${schedule}'`));
+    assert.equal(evaluate(groupExpression, 'schedule', schedule, '', ''), block);
+    assert.equal(evaluate(blockExpression, 'schedule', schedule, '', ''), block);
+  }
+  for (const block of ['early', 'late']) {
+    assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'campaign', block), block);
+    assert.equal(evaluate(blockExpression, 'workflow_dispatch', '', 'campaign', block), block);
+  }
+  assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'smoke', 'early'), 'smoke');
+});
+
 test('workflow keeps schedules activation-gated and action versions immutable', () => {
   const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
   assert.match(workflow, /github\.event_name == 'schedule' && vars\.MARKET_STUDY_ENABLED == 'true'/);
-  assert.match(workflow, /github\.event\.schedule == '50 5 \* \* 1-5' && 'early'.*inputs\.mode == 'campaign' && inputs\.block/);
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/);
   assert.match(workflow, /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/);
