@@ -223,21 +223,25 @@ test('every retry schedule and manual capture map to the same block and concurre
   const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
   const groupExpression = /group: market-study-\$\{\{ (.*?) \}\}/.exec(workflow)![1];
   const blockExpression = /STUDY_BLOCK: \$\{\{ (.*?) \}\}/.exec(workflow.split('  campaign:')[1])![1];
+  const prepareBlockExpression = /STUDY_BLOCK: \$\{\{ (.*?) \}\}/.exec(workflow.split('  prepare:')[1].split('  campaign:')[0])![1];
   // These workflow expressions use only JS-compatible property access, ==, && and ||.
   const evaluate = (expression: string, event: string, schedule: string, mode: string, block: string) =>
     Function('github', 'inputs', `return (${expression});`)({ event_name: event, event: { schedule } }, { mode, block });
   for (const [schedule, block] of [
+    ['20,35 5 * * 1-5', 'early'], ['20,35 10 * * 1-5', 'late'],
     ['50,55 5 * * 1-5', 'early'], ['0,5,10,15 6 * * 1-5', 'early'],
     ['50,55 10 * * 1-5', 'late'], ['0,5,10,15 11 * * 1-5', 'late'],
   ]) {
     assert.ok(workflow.includes(`cron: '${schedule}'`));
     assert.equal(evaluate(groupExpression, 'schedule', schedule, '', ''), block);
     assert.equal(evaluate(blockExpression, 'schedule', schedule, '', ''), block);
+    assert.equal(evaluate(prepareBlockExpression, 'schedule', schedule, '', ''), block);
   }
   for (const block of ['early', 'late']) {
     assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'campaign', block), block);
     assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'arm', block), block);
     assert.equal(evaluate(blockExpression, 'workflow_dispatch', '', 'campaign', block), block);
+    assert.equal(evaluate(prepareBlockExpression, 'workflow_dispatch', '', 'arm', block), block);
   }
   assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'smoke', 'early'), 'smoke');
   assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'observe', 'early'), 'observe');
@@ -250,7 +254,11 @@ test('prepared capture cannot run after preparation fails or is cancelled, while
     Function('github', 'inputs', 'needs', 'vars', 'cancelled', 'format', `return (${expression});`)(
       { event_name: event, event: { repository: { private: false, default_branch: 'main' } }, ref: trusted ? 'refs/heads/main' : 'refs/pull/1/merge' },
       { mode }, { prepare: { result } }, { MARKET_STUDY_ENABLED: enabled }, () => cancelled, (_: string, value: string) => `refs/heads/${value}`);
-  assert.equal(evaluate('schedule', '', 'skipped', false), true);
+  assert.equal(evaluate('schedule', '', 'success', false), true);
+  for (const result of ['failure', 'cancelled', 'skipped']) assert.equal(evaluate('schedule', '', result, false), false);
+  assert.equal(evaluate('schedule', '', 'success', true), false);
+  assert.equal(evaluate('schedule', '', 'success', false, 'false'), false);
+  assert.equal(evaluate('schedule', '', 'success', false, 'true', false), false);
   assert.equal(evaluate('workflow_dispatch', 'campaign', 'skipped', false), true);
   assert.equal(evaluate('workflow_dispatch', 'arm', 'success', false), true);
   for (const result of ['failure', 'cancelled', 'skipped']) assert.equal(evaluate('workflow_dispatch', 'arm', result, false), false);
