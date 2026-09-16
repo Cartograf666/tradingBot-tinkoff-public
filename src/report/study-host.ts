@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export type StudyOperation = 'campaign' | 'preflight' | 'smoke' | 'observe' | 'freeze' | 'status';
+export type StudyOperation = 'campaign' | 'preflight' | 'smoke' | 'observe' | 'freeze' | 'status' | 'report';
 class StudyHostError extends Error {}
 const repositoryName = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
@@ -47,7 +47,7 @@ export async function verifyPrivateStudyTarget(target: string,
 
 async function main() {
   const operation = process.argv[2];
-  if (!['campaign', 'preflight', 'smoke', 'observe', 'freeze', 'status'].includes(operation)) throw new StudyHostError('Unknown study operation');
+  if (!['campaign', 'preflight', 'smoke', 'observe', 'freeze', 'status', 'report'].includes(operation)) throw new StudyHostError('Unknown study operation');
   const target = resolveStudyHost(process.env, operation as StudyOperation);
   await verifyPrivateStudyTarget(target, repository => new Promise((resolve, reject) => {
     execFile('gh', ['api', `/repos/${repository}`], { encoding: 'utf8', maxBuffer: 1024 * 1024,

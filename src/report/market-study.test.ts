@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, waitUntil } from './market-study.js';
+import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyRecorderArguments, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
@@ -267,4 +267,15 @@ test('workflow keeps schedules activation-gated and action versions immutable', 
   assert.match(workflow, /actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/);
   assert.match(workflow, /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/);
   assert.doesNotMatch(workflow, /TINKOFF_API_TOKEN_PROD/);
+});
+
+// Reproduces the campaign caller bug: preparation must consume, not extend, the owned slot.
+test('campaign caller supplies an absolute deadline including the existing end margin', () => {
+  const chunk = { index: 1, plannedStart: '2026-09-16T11:00:00Z', plannedEnd: '2026-09-16T11:30:00Z' };
+  const signal = new AbortController().signal;
+  const args = studyRecorderArguments('/tmp/test', chunk, Date.parse('2026-09-16T11:00:08Z'), signal);
+  assert.equal(args.captureDeadlineMs, Date.parse('2026-09-16T11:29:55Z'));
+  assert.equal(args.parentSignal, signal); assert.equal(args.setExitCodeOnFailure, false);
+  assert.equal(boundedCaptureDuration(args.seconds * 1000, Date.parse('2026-09-16T11:00:20Z'), args.captureDeadlineMs), 1_775_000);
+  assert.throws(() => studyRecorderArguments('/tmp/test', chunk, Date.parse('2026-09-16T11:29:56Z'), signal));
 });

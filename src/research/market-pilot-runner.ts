@@ -8,6 +8,7 @@ import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { InstrumentIdType } from 'tinkoff-invest-api/dist/generated/instruments.js';
 import { getTinkoffClientOptions } from '../core/tinkoff-client.js';
 import { recordMarket, type RecorderArguments } from '../report/record-market.js';
+import { retryMetadata } from '../report/metadata-retry.js';
 import { normalizeIntervals, type ObservationInstrument, type ObservationInterval } from './market-observation.js';
 import { nextMainSessionWindow } from './observation-session.js';
 import { writePilotQualityReport } from './market-pilot-quality.js';
@@ -188,10 +189,10 @@ export async function discoverMarketPilot(
 ): Promise<PilotDiscovery> {
   const instruments: ObservationInstrument[] = [];
   for (const ticker of tickers) {
-    const response = await api.instruments.shareBy(
+    const response = await retryMetadata(requestSignal => api.instruments.shareBy(
       { idType: InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER, id: ticker, classCode: 'TQBR' },
-      { signal: AbortSignal.any([signal, AbortSignal.timeout(RPC_TIMEOUT_MS)]) },
-    );
+      { signal: requestSignal },
+    ), { operation: 'shareBy', signal, attemptTimeoutMs: RPC_TIMEOUT_MS });
     const instrument = response.instrument;
     if (!instrument || instrument.ticker !== ticker || instrument.classCode !== 'TQBR'
       || instrument.currency.toUpperCase() !== 'RUB' || !instrument.apiTradeAvailableFlag || !instrument.uid
@@ -204,10 +205,10 @@ export async function discoverMarketPilot(
       exchange: instrument.exchange, sector: instrument.sector,
     });
   }
-  const schedules = await api.instruments.tradingSchedules(
+  const schedules = await retryMetadata(requestSignal => api.instruments.tradingSchedules(
     { from: new Date(atMs), to: new Date(atMs + 4 * 86_400_000) },
-    { signal: AbortSignal.any([signal, AbortSignal.timeout(RPC_TIMEOUT_MS)]) },
-  );
+    { signal: requestSignal },
+  ), { operation: 'tradingSchedules', signal, attemptTimeoutMs: RPC_TIMEOUT_MS });
   const exchanges = [...new Set(instruments.map((instrument) => instrument.exchange.toUpperCase()))];
   return {
     instruments,

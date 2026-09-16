@@ -14,7 +14,7 @@ on:
         type: choice
         required: true
         default: check
-        options: [check, preflight, smoke, observe, campaign, arm, freeze, status]
+        options: [check, preflight, smoke, observe, campaign, arm, freeze, status, report]
       block:
         description: 'Блок полной сессии (campaign или arm)'
         type: choice
@@ -117,7 +117,7 @@ jobs:
       github.event.repository.private == false &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'preflight' || inputs.mode == 'smoke' || inputs.mode == 'observe' || inputs.mode == 'freeze' || inputs.mode == 'status')
+      (inputs.mode == 'preflight' || inputs.mode == 'smoke' || inputs.mode == 'observe' || inputs.mode == 'freeze' || inputs.mode == 'status' || inputs.mode == 'report')
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.mode == 'observe' && 350 || 10 }}
     steps:
@@ -143,7 +143,7 @@ jobs:
           node .study-dist/src/report/market-study.js "$STUDY_MODE" \
             --workspace "$RUNNER_TEMP/market-study" --repo "$MARKET_STUDY_DATA_REPOSITORY"
       - name: Inspect private state or freeze the tested version
-        if: inputs.mode == 'freeze' || inputs.mode == 'status'
+        if: inputs.mode == 'freeze' || inputs.mode == 'status' || inputs.mode == 'report'
         env:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}

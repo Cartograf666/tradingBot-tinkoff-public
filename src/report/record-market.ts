@@ -10,6 +10,7 @@ import { getTinkoffClientOptions } from '../core/tinkoff-client.js';
 import { RecordingWriter } from '../research/market-recording.js';
 import { captureMarketStream } from '../research/market-recorder.js';
 import { reportMarketRecording } from '../research/market-recording-report.js';
+import { captureDeadlineSignal, classifyMetadataError, MetadataRequestFailure, retryMetadata, type MetadataDiagnostic, type MetadataOperation } from './metadata-retry.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { normalizeIntervals, observationSubscriptions, subscriptionAcknowledgments, type ObservationManifest, type RequestedSource } from '../research/market-observation.js';
 
@@ -18,6 +19,8 @@ export interface RecorderArguments {
   budgetRub: number; commissionRate: number; outputDir: string; maxBytes: number;
   segmentMaxBytes?: number; session?: 'any' | 'main';
   captureDeadlineMs?: number;
+  parentSignal?: AbortSignal;
+  setExitCodeOnFailure?: boolean;
 }
 
 export function boundedCaptureDuration(requestedMs: number, nowMs: number, deadlineMs?: number): number {
@@ -58,6 +61,21 @@ export function parseRecorderArguments(args: string[], root: string): RecorderAr
   };
 }
 
+export function captureCompletionReason(reason: string, userAborted: boolean, nowMs: number, deadlineMs?: number): string {
+  // The absolute wall-clock guard starts before writer setup; it may win the stream's later relative timer.
+  return reason === 'aborted' && !userAborted && deadlineMs !== undefined && nowMs >= deadlineMs ? 'duration' : reason;
+}
+
+export function recorderFailure(error: unknown, stage: string): {
+  code: number | null; stage: string; category: string; retryable: boolean;
+  operation?: MetadataOperation; attempt?: number;
+} {
+  const diagnostic = error instanceof MetadataRequestFailure ? error.diagnostic : classifyMetadataError(error);
+  const retryable = stage === 'metadata' && ['TIMEOUT', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(diagnostic.classification);
+  return { code: diagnostic.code, stage, category: diagnostic.classification, retryable,
+    ...(error instanceof MetadataRequestFailure ? { operation: error.diagnostic.operation, attempt: error.diagnostic.attempt } : {}) };
+}
+
 class ObservationApi extends TinkoffInvestApi { close(): void { this.channel.close(); } }
 function writeJson(file: string, value: unknown): void {
   const temporary = `${file}.tmp`;
@@ -66,6 +84,7 @@ function writeJson(file: string, value: unknown): void {
 }
 
 export async function recordMarket(args: RecorderArguments, root: string): Promise<string> {
+  boundedCaptureDuration(args.seconds * 1000, Date.now(), args.captureDeadlineMs);
   // Do not import application config: it starts unrelated validation/logging and can exit the process.
   const local = existsSync(path.join(root, '.env')) ? dotenv.parse(readFileSync(path.join(root, '.env'))) : {};
   const tokenSettings = { ...local, ...process.env };
@@ -74,7 +93,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   const runId = randomUUID();
   const directory = path.join(args.outputDir, `${new Date().toISOString().replaceAll(':', '-')}-${runId.slice(0, 8)}`);
   mkdirSync(args.outputDir, { recursive: true }); mkdirSync(directory, { mode: 0o700 });
-  const files = ['src/report/record-market.ts', 'src/research/market-recorder.ts', 'src/research/market-recording.ts',
+  const files = ['src/report/record-market.ts', 'src/report/metadata-retry.ts', 'src/research/market-recorder.ts', 'src/research/market-recording.ts',
     'src/research/market-observation.ts', 'src/research/market-recording-report.ts', 'src/research/order-book-costs.ts',
     'src/research/observation-session.ts', 'src/core/tinkoff-client.ts', 'certs/russian-trusted-root-ca.pem', 'package-lock.json'];
   const codeHashes = Object.fromEntries(files.map(file => [file, createHash('sha256').update(readFileSync(path.join(root, file))).digest('hex')]));
@@ -100,12 +119,23 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   const stop = () => controller.abort();
   // A terminal and an npm parent can both forward the same interrupt. Keep cleanup idempotent.
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  const onParentAbort = () => controller.abort(args.parentSignal?.reason);
+  args.parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+  if (args.parentSignal?.aborted) onParentAbort();
+  const captureBound = captureDeadlineSignal(args.captureDeadlineMs, controller.signal);
   let writer: RecordingWriter | undefined, stage = 'metadata';
-  const requestSignal = () => AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]);
+  const metadataDiagnostics: MetadataDiagnostic[] = [];
+  const metadata = <T>(operation: MetadataOperation, request: (signal: AbortSignal) => Promise<T>) => retryMetadata(request, {
+    operation, signal: controller.signal, deadlineMs: args.captureDeadlineMs,
+    onDiagnostic: diagnostic => {
+      metadataDiagnostics.push(diagnostic);
+      writeJson(path.join(directory, 'metadata-retries.json'), metadataDiagnostics);
+    },
+  });
   try {
     const shares = [];
     for (const ticker of args.tickers) {
-      const { instrument: i } = await api.instruments.shareBy({ idType: InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER, id: ticker, classCode: 'TQBR' }, { signal: requestSignal() });
+      const { instrument: i } = await metadata('shareBy', signal => api.instruments.shareBy({ idType: InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER, id: ticker, classCode: 'TQBR' }, { signal }));
       if (!i || i.ticker !== ticker || i.classCode !== 'TQBR' || i.currency.toUpperCase() !== 'RUB'
         || !i.apiTradeAvailableFlag || !i.uid || !Number.isSafeInteger(i.lot) || i.lot <= 0) throw new Error('Unsupported or mismatched instrument');
       shares.push(i);
@@ -114,18 +144,20 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
     }
     writeJson(path.join(directory, 'instrument-responses.json'), shares);
     const now = new Date();
-    const schedules = await api.instruments.tradingSchedules({ from: now, to: new Date(now.getTime() + 2 * 86400000) }, { signal: requestSignal() });
+    const schedules = await metadata('tradingSchedules', signal => api.instruments.tradingSchedules({ from: now, to: new Date(now.getTime() + 2 * 86400000) }, { signal }));
     manifest.scheduleFetchedAt = new Date().toISOString();
     // Save the exact calendars belonging to this run, preserving all fields for future interpretation.
     const exchanges = new Set(manifest.instruments.map(i => i.exchange.toUpperCase()));
     const relevant = { exchanges: schedules.exchanges.filter(s => exchanges.has(s.exchange.toUpperCase())) };
     writeJson(path.join(directory, 'schedule-response.json'), relevant);
     manifest.intervals = normalizeIntervals(relevant, [...exchanges]);
-    const statuses = await api.marketdata.getTradingStatuses({ instrumentId: manifest.instruments.map(i => i.uid) }, { signal: requestSignal() });
+    const statuses = await metadata('getTradingStatuses', signal => api.marketdata.getTradingStatuses({ instrumentId: manifest.instruments.map(i => i.uid) }, { signal }));
     writeJson(path.join(directory, 'initial-trading-statuses.json'), { receivedAt: new Date().toISOString(), response: statuses });
+    const checkedAt = Date.now();
+    manifest.settings.durationMs = boundedCaptureDuration(manifest.settings.durationMs, checkedAt, args.captureDeadlineMs);
+    if (args.captureDeadlineMs !== undefined) manifest.notes.push(`Absolute capture deadline: ${new Date(args.captureDeadlineMs).toISOString()}`);
     if (args.session === 'main') {
       if (args.source !== 'exchange') throw new Error('Main session requires exchange source');
-      const checkedAt = Date.now();
       manifest.nextSession = nextMainSessionWindow(manifest.instruments, manifest.intervals, checkedAt, manifest.settings.durationMs);
       if (!manifest.nextSession || Date.parse(manifest.nextSession.start) > checkedAt) {
         manifest.status = 'WAITING_FOR_MAIN_SESSION'; writeJson(manifestFile, manifest);
@@ -133,8 +165,6 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
         return directory;
       }
     }
-    manifest.settings.durationMs = boundedCaptureDuration(manifest.settings.durationMs, Date.now(), args.captureDeadlineMs);
-    if (args.captureDeadlineMs !== undefined) manifest.notes.push(`Absolute capture deadline: ${new Date(args.captureDeadlineMs).toISOString()}`);
     manifest.status = 'RECORDING'; writeJson(manifestFile, manifest);
     stage = 'stream';
     writer = new RecordingWriter({ path: path.join(directory, 'events.ndjson'), runId, maxBytes: args.maxBytes,
@@ -162,8 +192,9 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
       acknowledgments: payload => subscriptionAcknowledgments(payload, args.source, args.depth),
       durationMs: manifest.settings.durationMs, subscriptionTimeoutMs: manifest.settings.subscriptionTimeoutMs,
       heartbeatTimeoutMs: manifest.settings.heartbeatTimeoutMs, tickIntervalMs: manifest.settings.sampleIntervalMs,
-      maxReconnects: manifest.settings.maxReconnects, backoffMs: [1000, 2000, 5000, 10000, 20000], signal: controller.signal,
+      maxReconnects: manifest.settings.maxReconnects, backoffMs: [1000, 2000, 5000, 10000, 20000], signal: captureBound.signal,
     });
+    manifest.capture.reason = captureCompletionReason(manifest.capture.reason, controller.signal.aborted, Date.now(), args.captureDeadlineMs);
     manifest.recording = writer.close(); writer = undefined;
     manifest.status = ['duration', 'aborted', 'duration_elapsed', 'external_abort'].includes(manifest.capture.reason.toLowerCase()) ? 'COMPLETE' : 'FAILED';
     manifest.completedAt = new Date().toISOString(); writeJson(manifestFile, manifest);
@@ -173,19 +204,21 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
       subscriptions: `${summary.successfulSubscriptions.length}/${summary.expectedSubscriptions.length}`, books: summary.bookEvents,
       trades: summary.tradeEvents, exchangeSamples: summary.exchangeSamples, dealerSamples: summary.dealerSamples,
       evidence: summary.evidence }, null, 2));
-    if (manifest.status === 'FAILED') process.exitCode = 1;
+    if (manifest.status === 'FAILED' && args.setExitCodeOnFailure !== false) process.exitCode = 1;
   } catch (error) {
     controller.abort();
     if (writer) { try { manifest.recording = writer.close(); } catch { /* Integrity will be checked from the partial file. */ } }
     manifest.status = 'FAILED'; manifest.completedAt = new Date().toISOString();
-    const code = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'number' ? error.code : null;
-    manifest.failure = { code, stage }; writeJson(manifestFile, manifest);
+    manifest.failure = recorderFailure(error, stage); writeJson(manifestFile, manifest);
     if (existsSync(path.join(directory, 'events.ndjson')) && stage !== 'report') {
       try { await reportMarketRecording(directory); } catch { /* Retain the original recording and manifest for diagnosis. */ }
     }
-    console.error(JSON.stringify({ status: 'FAILED', stage, code, directory })); process.exitCode = 1;
+    console.error(JSON.stringify({ status: 'FAILED', ...manifest.failure, directory }));
+    if (args.setExitCodeOnFailure !== false) process.exitCode = 1;
   } finally {
-    controller.abort(); api.close(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
+    controller.abort(); captureBound.dispose(); api.close();
+    args.parentSignal?.removeEventListener('abort', onParentAbort);
+    process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
   return directory;
 }

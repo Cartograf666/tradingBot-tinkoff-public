@@ -11,6 +11,7 @@ import {
 } from './market-observation.js';
 
 interface Group {
+  freshness: BookFreshnessDiagnostics;
   ticker: string; source: ObservationSource;
   bookEvents: number; tradeEvents: number; validTradeEvents: number;
   regularTradeEvents: number; tradeLots: number;
@@ -53,6 +54,84 @@ function distribution(values: number[]) {
     p95: sorted[Math.ceil(sorted.length * .95) - 1], min: sorted[0], max: sorted.at(-1)! };
 }
 
+/** Reproducible, bounded reservoir; counts/mean/extrema use every observation. */
+class TimingDistribution {
+  private readonly values: number[] = [];
+  private count = 0;
+  private mean = 0;
+  private min = Infinity;
+  private max = -Infinity;
+  private randomState = 0x12345678;
+  add(value: number): void {
+    if (!Number.isFinite(value)) return;
+    this.count++; this.mean += (value - this.mean) / this.count;
+    this.min = Math.min(this.min, value); this.max = Math.max(this.max, value);
+    if (this.values.length < 4096) this.values.push(value);
+    else {
+      this.randomState ^= this.randomState << 13; this.randomState ^= this.randomState >>> 17; this.randomState ^= this.randomState << 5;
+      const index = Math.floor((this.randomState >>> 0) / 0x100000000 * this.count);
+      if (index < 4096) this.values[index] = value;
+    }
+  }
+  result() {
+    const sampled = distribution(this.values);
+    return { samples: this.count, quantileSamples: this.values.length,
+      quantileMethod: this.count > 4096 ? 'DETERMINISTIC_RESERVOIR_4096' : 'EXACT',
+      mean: this.count ? this.mean : null, median: sampled.median, p95: sampled.p95,
+      min: this.count ? this.min : null, max: this.count ? this.max : null };
+  }
+}
+
+class BookFreshnessDiagnostics {
+  readonly sourceAgeAtReceiptMs = new TimingDistribution();
+  readonly bookReceiptIntervalMs = new TimingDistribution();
+  readonly usableBookResidenceAtSampleMs = new TimingDistribution();
+  readonly streamResponseSilenceAtExpiredSampleMs = new TimingDistribution();
+  private previousReceiptOffset: bigint | null = null;
+  latest: { epoch: number; reason: string | null } | null = null;
+  timestampedBooks = 0;
+  missingTimestampBooks = 0;
+  lateAtReceiptBooks = 0;
+  futureAtReceiptBooks = 0;
+  usableAtReceiptBooks = 0;
+  booksOutsideCurrentConnection = 0;
+  scheduledSamples = 0;
+  samplesAfterLateAtReceiptBook = 0;
+  samplesAfterOtherRejectedBook = 0;
+  samplesWithoutCurrentBook = 0;
+  samplesExpiredByReceiptSilence = 0;
+  samplesExpiredBySourceAgeWithinReceiptLimit = 0;
+  reset(): void { this.previousReceiptOffset = null; this.latest = null; }
+  receipt(book: OrderBook, wall: number, offset: bigint, maxAge: number, maxSkew: number, currentConnection: boolean): void {
+    if (currentConnection) {
+      if (this.previousReceiptOffset !== null) this.bookReceiptIntervalMs.add(Number(offset - this.previousReceiptOffset) / 1e6);
+      this.previousReceiptOffset = offset;
+    } else this.booksOutsideCurrentConnection++;
+    const time = book.time?.getTime();
+    if (time === undefined || !Number.isFinite(time)) { this.missingTimestampBooks++; return; }
+    const age = wall - time;
+    this.timestampedBooks++; this.sourceAgeAtReceiptMs.add(age);
+    if (age > maxAge) this.lateAtReceiptBooks++;
+    if (age < -maxSkew) this.futureAtReceiptBooks++;
+  }
+  result() {
+    return {
+      timestampedBooks: this.timestampedBooks, missingTimestampBooks: this.missingTimestampBooks,
+      lateAtReceiptBooks: this.lateAtReceiptBooks, futureAtReceiptBooks: this.futureAtReceiptBooks,
+      usableAtReceiptBooks: this.usableAtReceiptBooks, booksOutsideCurrentConnection: this.booksOutsideCurrentConnection,
+      scheduledSamples: this.scheduledSamples,
+      samplesAfterLateAtReceiptBook: this.samplesAfterLateAtReceiptBook,
+      samplesAfterOtherRejectedBook: this.samplesAfterOtherRejectedBook,
+      samplesWithoutCurrentBook: this.samplesWithoutCurrentBook,
+      samplesExpiredByReceiptSilence: this.samplesExpiredByReceiptSilence,
+      samplesExpiredBySourceAgeWithinReceiptLimit: this.samplesExpiredBySourceAgeWithinReceiptLimit,
+      sourceAgeAtReceiptMs: this.sourceAgeAtReceiptMs.result(), bookReceiptIntervalMs: this.bookReceiptIntervalMs.result(),
+      usableBookResidenceAtSampleMs: this.usableBookResidenceAtSampleMs.result(),
+      streamResponseSilenceAtExpiredSampleMs: this.streamResponseSilenceAtExpiredSampleMs.result(),
+    };
+  }
+}
+
 /** Consumes in local receipt order, never sorts by exchange time or deduplicates trades. */
 export class ObservationAccumulator {
   private readonly groups = new Map<string, Group>();
@@ -77,10 +156,27 @@ export class ObservationAccumulator {
   private disconnects = 0;
   private gapMarkers = 0;
   private readonly ackFailures: Record<string, number> = {};
+  private readonly streamResponseIntervalMs = new TimingDistribution();
+  private readonly recordedTickIntervalMs = new TimingDistribution();
+  private readonly recordedTickDelayMs = new TimingDistribution();
+  private lastStreamResponseOffset: bigint | null = null;
+  private lastTickOffset: bigint | null = null;
+  private connectionAttempts = 0;
+  private heartbeatTimeouts = 0;
+  private subscriptionTimeouts = 0;
+  private ackFailureBookResets = 0;
+  private delayedTickIntervals = 0;
+  private ignoredDuplicateTicks = 0;
+
+  private resetFreshnessState(): void {
+    for (const group of this.groups.values()) group.freshness.reset();
+    this.lastStreamResponseOffset = null;
+  }
 
   constructor(private readonly manifest: ObservationManifest) {
     for (const instrument of manifest.instruments) for (const source of ['EXCHANGE', 'DEALER', 'UNKNOWN'] as const) {
       this.groups.set(`${instrument.uid}:${source}`, {
+        freshness: new BookFreshnessDiagnostics(),
         ticker: instrument.ticker, source, bookEvents: 0, tradeEvents: 0, validTradeEvents: 0,
         regularTradeEvents: 0, tradeLots: 0, rejectedBooks: {}, rejectedTrades: {}, sampleExclusions: {}, phases: {},
         sampled: 0, regularSamples: 0, spreadBps: [], costsRub: [], breakEvenBps: [], stressBreakEvenBps: [],
@@ -96,11 +192,13 @@ export class ObservationAccumulator {
       const elapsed = Number(offset - BigInt(this.lastEvent.monotonicOffsetNs)) / 1e6;
       if (Math.abs(wall - Date.parse(this.lastEvent.receivedAt) - elapsed) > this.manifest.settings.maxFutureSkewMs) {
         this.latestBooks.clear(); this.clockJumps++;
+        this.resetFreshnessState();
       }
     }
     this.firstEvent ??= event;
     this.lastEvent = event;
     if (event.kind === 'connect_attempt') {
+      this.connectionAttempts++; this.resetFreshnessState();
       this.currentEpoch = event.connectionEpoch; this.connected = true;
       this.latestBooks.clear(); this.acks.clear(); this.statuses.clear(); this.lastSourceTimes.clear();
       return;
@@ -109,13 +207,23 @@ export class ObservationAccumulator {
       this.latestBooks.clear(); this.acks.clear(); this.statuses.clear(); this.connected = false;
       if (event.kind === 'disconnect') this.disconnects++;
       if (event.kind === 'gap') this.gapMarkers++;
+      if (event.kind === 'heartbeat_timeout') this.heartbeatTimeouts++;
+      if (event.kind === 'subscription_timeout') this.subscriptionTimeouts++;
+      this.resetFreshnessState();
       return;
     }
     if (event.kind === 'tick') {
+      if (this.lastTickOffset !== null) {
+        const interval = Number(offset - this.lastTickOffset) / 1e6;
+        this.recordedTickIntervalMs.add(interval);
+        this.recordedTickDelayMs.add(Math.max(0, interval - this.manifest.settings.sampleIntervalMs));
+        if (interval > this.manifest.settings.sampleIntervalMs * 1.1) this.delayedTickIntervals++;
+      }
+      this.lastTickOffset = offset;
       // A late timer is one observation, not permission to fabricate missed seconds.
       if (this.lastSampleOffset === null || Number(offset - this.lastSampleOffset) / 1e6 >= this.manifest.settings.sampleIntervalMs * .9) {
         this.sample(wall, offset); this.lastSampleOffset = offset; this.totalTicks++;
-      }
+      } else this.ignoredDuplicateTicks++;
       return;
     }
     if (event.kind !== 'response') return;
@@ -130,10 +238,14 @@ export class ObservationAccumulator {
       return;
     }
     this.responses++;
+    if (event.connectionEpoch === this.currentEpoch && this.connected) {
+      if (this.lastStreamResponseOffset !== null) this.streamResponseIntervalMs.add(Number(offset - this.lastStreamResponseOffset) / 1e6);
+      this.lastStreamResponseOffset = offset;
+    }
     const r = MarketDataResponse.fromJSON(event.payload);
     for (const ack of subscriptionAcknowledgments(event.payload, this.manifest.source, this.manifest.settings.depth)) {
       if (ack.success) { this.acks.add(ack.key); this.successfulAcks.add(ack.key); }
-      else { this.acks.delete(ack.key); increment(this.ackFailures, ack.key); this.latestBooks.clear(); }
+      else { this.acks.delete(ack.key); increment(this.ackFailures, ack.key); this.latestBooks.clear(); this.resetFreshnessState(); this.ackFailureBookResets++; }
     }
     if (r.tradingStatus) this.statuses.set(r.tradingStatus.instrumentUid, r.tradingStatus.tradingStatus);
     if (r.orderbook) {
@@ -142,13 +254,19 @@ export class ObservationAccumulator {
       const group = this.groups.get(key), instrument = this.manifest.instruments.find(i => i.uid === book.instrumentUid);
       if (!group) return;
       group.bookEvents++;
+      // Observe timing independently of quality; never use diagnostics to admit a book.
+      group.freshness.receipt(book, wall, offset, this.manifest.settings.maxBookAgeMs, this.manifest.settings.maxFutureSkewMs,
+        this.connected && event.connectionEpoch === this.currentEpoch);
       const quality = qualifyBook(book, instrument, wall, this.manifest.settings);
+      group.freshness.latest = { epoch: event.connectionEpoch, reason: quality.usable ? null : quality.reason };
       if (!quality.usable) { increment(group.rejectedBooks, quality.reason); this.latestBooks.delete(key); return; }
       const previousTime = this.lastSourceTimes.get(`book:${key}`);
       if (previousTime !== undefined && quality.timestampMs < previousTime) {
+        group.freshness.latest.reason = 'OUT_OF_ORDER';
         this.sourceReorders++; increment(group.rejectedBooks, 'OUT_OF_ORDER'); this.latestBooks.delete(key); return;
       }
       this.lastSourceTimes.set(`book:${key}`, quality.timestampMs);
+      group.freshness.usableAtReceiptBooks++;
       this.latestBooks.set(key, { book, epoch: event.connectionEpoch, offsetNs: offset, receivedAt: wall });
     }
     if (r.trade) {
@@ -183,6 +301,25 @@ export class ObservationAccumulator {
       }
       const exclude = (reason: string) => { increment(group.sampleExclusions, reason); if (costs) increment(costs.exclusions, reason); };
       const saved = this.latestBooks.get(key);
+      if (costs) {
+        const diagnostics = group.freshness;
+        diagnostics.scheduledSamples++;
+        if (!saved || saved.epoch !== this.currentEpoch) {
+          if (diagnostics.latest?.epoch !== this.currentEpoch) diagnostics.samplesWithoutCurrentBook++;
+          else if (diagnostics.latest.reason === 'STALE') diagnostics.samplesAfterLateAtReceiptBook++;
+          else diagnostics.samplesAfterOtherRejectedBook++;
+        } else {
+          const residence = Number(offset - saved.offsetNs) / 1e6;
+          diagnostics.usableBookResidenceAtSampleMs.add(residence);
+          const receiptExpired = residence > this.manifest.settings.maxBookAgeMs;
+          const sourceExpired = wall - saved.book.time!.getTime() > this.manifest.settings.maxBookAgeMs;
+          if (receiptExpired) diagnostics.samplesExpiredByReceiptSilence++;
+          else if (sourceExpired) diagnostics.samplesExpiredBySourceAgeWithinReceiptLimit++;
+          if ((receiptExpired || sourceExpired) && this.lastStreamResponseOffset !== null) {
+            diagnostics.streamResponseSilenceAtExpiredSampleMs.add(Number(offset - this.lastStreamResponseOffset) / 1e6);
+          }
+        }
+      }
       let exclusion: string | null = !this.connected ? 'DISCONNECTED' : !this.acks.has(`book:${instrument.uid}`) ? 'NO_BOOK_ACK' : !saved ? 'NO_VALID_BOOK' : null;
       if (saved && (saved.epoch !== this.currentEpoch || Number(offset - saved.offsetNs) / 1e6 > this.manifest.settings.maxBookAgeMs)) exclusion = 'STALE_OR_PREVIOUS_CONNECTION';
       if (exclusion || !saved) { exclude(exclusion ?? 'NO_VALID_BOOK'); continue; }
@@ -214,9 +351,11 @@ export class ObservationAccumulator {
 
   result() {
     const groups = [...this.groups.entries()].filter(([, g]) => g.source !== 'UNKNOWN' || g.bookEvents || g.tradeEvents).map(([key, g]) => ({
+      instrumentIndex: this.manifest.instruments.findIndex(i => `${i.uid}:${g.source}` === key),
       ticker: g.ticker, source: g.source, bookEvents: g.bookEvents, tradeEvents: g.tradeEvents,
       validTradeEvents: g.validTradeEvents, regularTradeEvents: g.regularTradeEvents, observedTradeLots: g.tradeLots,
       rejectedBooks: g.rejectedBooks, rejectedTrades: g.rejectedTrades, sampleExclusions: g.sampleExclusions, phaseCounts: g.phases,
+      freshnessDiagnostics: g.freshness.result(),
       eligibleSamples: g.sampled, eligibleSecondsApprox: g.sampled * this.manifest.settings.sampleIntervalMs / 1000,
       phases: [...(this.phaseCosts.get(key) ?? new Map<string, PhaseCosts>())].map(([phase, c]) => ({
         observedScheduledTicks: c.observedScheduledTicks, usableShareOfObservedScheduledTicks: c.observedScheduledTicks ? c.sampled / c.observedScheduledTicks : null,
@@ -240,6 +379,16 @@ export class ObservationAccumulator {
       successfulSubscriptions: [...this.successfulAcks].sort(), expectedSubscriptions: observationSubscriptions(this.manifest.instruments),
       allSubscriptionsAcknowledged: observationSubscriptions(this.manifest.instruments).every(key => this.successfulAcks.has(key)),
       ackFailures: this.ackFailures, disconnects: this.disconnects, gapMarkers: this.gapMarkers, sourceReorders: this.sourceReorders, clockJumps: this.clockJumps,
+      freshnessDiagnostics: {
+        schemaVersion: 1, maxBookAgeMs: this.manifest.settings.maxBookAgeMs,
+        connectionAttempts: this.connectionAttempts, heartbeatTimeouts: this.heartbeatTimeouts,
+        subscriptionTimeouts: this.subscriptionTimeouts, ackFailureBookResets: this.ackFailureBookResets,
+        delayedTickIntervalThresholdMs: this.manifest.settings.sampleIntervalMs * 1.1,
+        delayedTickIntervals: this.delayedTickIntervals, ignoredDuplicateTicks: this.ignoredDuplicateTicks,
+        streamResponseIntervalMs: this.streamResponseIntervalMs.result(), recordedTickIntervalMs: this.recordedTickIntervalMs.result(),
+        recordedTickDelayMs: this.recordedTickDelayMs.result(),
+        interpretation: 'Receipt timestamps are stamped by the local recorder, not socket arrival. Source-to-receipt age combines source clock, provider, transport and local delivery/processing. Receipt silence and tick delay are observed gaps, not causal attribution. recordedTickDelayMs is nonnegative tick-interval excess over configured cadence, not deadline lateness or handler runtime. Expired sample diagnostics cover confirmed scheduled phases; receipt distributions cover all books. Quantiles above 4096 observations are bounded reproducible estimates; counts, mean and extrema use all observations.',
+      },
       exchangeSamples, dealerSamples,
       evidence: exchangeSamples ? 'EXCHANGE_OBSERVATIONS_RECEIVED' : dealerSamples ? 'DEALER_OBSERVATIONS_ONLY' : 'NO_USABLE_MARKET_SAMPLE',
       groups,

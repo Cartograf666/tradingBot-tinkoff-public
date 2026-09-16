@@ -7,12 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { TINKOFF_SANDBOX_ENDPOINT } from '../core/tinkoff-client.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
+import { closedPlansNeedingFinalization, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
 import { replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
 import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
 import {
-  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation,
+  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
@@ -505,7 +506,7 @@ export async function reconcileReleaseAssets(repository: string): Promise<StudyL
   await ensurePrivateRepository(repository);
   const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
   const known = new Set([...ledger.chunks.map(chunk => chunk.assetId), ...ledger.days.map(day => day.reportAssetId)]);
-  const candidates = (await releaseAssets(repository)).filter(asset => asset.name.startsWith('study-') && !known.has(asset.id));
+  const candidates = (await releaseAssets(repository)).filter(asset => /^(?:study-\d{4}-\d{2}-\d{2}-(?:early|late)-|study-day-)/.test(asset.name) && !known.has(asset.id));
   let current = ledger;
   for (const asset of candidates.sort((a, b) => a.id - b.id)) {
     const temporary = mkdtempSync(path.join(tmpdir(), 'market-study-reconcile-'));
@@ -630,6 +631,63 @@ export function studyChunkRecorded(ledger: StudyLedger, plan: StudyBlockPlan, ch
 
 type BlockResult = { action: 'CAPTURED'; plan: StudyBlockPlan; chunks: number; reportPath: string | null }
   | { action: 'SKIPPED'; reason: string; chunks: 0; reportPath: string | null };
+export function studyRecorderArguments(workspace: string, chunk: StudyChunkPlan, nowMs: number, signal: AbortSignal): RecorderArguments {
+  const seconds = chunkDurationSeconds(chunk, nowMs);
+  if (seconds <= 0) throw new Error('Owned recording window expired');
+  return { ...recorderArguments(workspace, seconds, 'main'),
+    captureDeadlineMs: Date.parse(chunk.plannedEnd) - STUDY_CHUNK_END_MARGIN_MS,
+    parentSignal: signal, setExitCodeOnFailure: false };
+}
+function appendStudySummary(message: string): void {
+  console.log(message);
+  if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n\n`, { flag: 'a' });
+}
+async function saveOperation(repository: string, operation: BlockOperation): Promise<void> {
+  if (!/^\d+:\d+$/.test(operation.attemptId)) throw new Error('Invalid operational attempt identity');
+  const file = `operations/${operation.attemptId.replace(':', '-')}.json`;
+  operation.updatedAt = new Date().toISOString();
+  const remote = await readRemoteText(repository, file);
+  await putRemoteFile(repository, file, `${JSON.stringify(operation, null, 2)}\n`, remote.sha, 'Update capture operational evidence');
+}
+
+/** Runs without broker access, including after a crashed job or on the next morning. */
+export async function refreshOperationalReports(repository: string): Promise<number> {
+  let ledger = await reconcileReleaseAssets(repository);
+  const operations: BlockOperation[] = [];
+  for (const attempt of ledger.attempts) {
+    if (!/^\d+:\d+$/.test(attempt.attemptId)) continue;
+    const text = await readRemoteText(repository, `operations/${attempt.attemptId.replace(':', '-')}.json`);
+    if (text.value) operations.push(JSON.parse(text.value) as BlockOperation);
+  }
+  let replayFailures = 0;
+  const recoveryWorkspace = mkdtempSync(path.join(tmpdir(), 'market-study-report-'));
+  try {
+    for (const plan of closedPlansNeedingFinalization(ledger, operations)) {
+      try { await maybeFinalizeStudyDay(repository, plan, recoveryWorkspace); }
+      catch {
+        replayFailures += 1;
+        appendStudySummary('Полный научный отчёт не восстановлен: требуется проверка сохранённых данных и версии обработки. Операционная сводка будет сохранена отдельно.');
+      }
+    }
+  } finally { rmSync(recoveryWorkspace, { recursive: true, force: true }); }
+  ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+  const today = new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10);
+  const previous = new Date(`${today}T00:00:00Z`);
+  do { previous.setUTCDate(previous.getUTCDate() - 1); } while ([0, 6].includes(previous.getUTCDay()));
+  const dates = [...new Set([...ledger.attempts.map(item => item.sessionDate).filter((date): date is string => Boolean(date)), previous.toISOString().slice(0, 10), today])].sort();
+  for (const date of dates) {
+    const day = operationalDay(ledger, operations, date);
+    const file = `reports/daily-${date}.json`, previous = await readRemoteText(repository, file);
+    await putRemoteFile(repository, file, `${JSON.stringify(day, null, 2)}\n`, previous.sha, `Report capture completeness ${date}`);
+    appendStudySummary(renderOperationalDay(day));
+  }
+  const readme = await readRemoteText(repository, README_PATH);
+  await putRemoteFile(repository, README_PATH, ledgerReadme(ledger, repository)
+    + `\nOperational daily reports: [reports](https://github.com/${repository}/tree/${STUDY_STATE_BRANCH}/reports). Incomplete days are reported separately and never accepted as scientific evidence.\n`, readme.sha, 'Refresh study completeness status');
+  if (replayFailures) throw new Error('Scientific report recovery failed; operational evidence was saved');
+  return dates.length;
+}
+
 export async function captureStudyBlock(repository: string, block: StudyBlock, workspace: string,
   runId: string, runAttempt: number, signal: AbortSignal): Promise<BlockResult> {
   if (process.env.MARKET_STUDY_ENABLED !== 'true') throw new Error('Full-session campaign is paused pending storage configuration, sandbox smoke and activation');
@@ -648,45 +706,83 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
   let persisted = await updateRemoteLedger(repository, ledger => beginStudyAttempt(ledger, { runId, runAttempt,
     sessionDate: plan.sessionDate, block, mode: 'COUNTED', startedAt: new Date().toISOString() }), `Begin ${plan.sessionDate} ${block}`);
   assertFrozenRuntime(persisted);
-  return runAfterBlockCheck(Date.parse(plan.captureNotBefore), signal, async () => {
-    console.log('Automatic block check: recording 60 seconds of exchange main-session data.');
-    await checkedSmoke(workspace, repository, signal,
-      Math.min(Date.parse(plan.ownedStart) + STUDY_LAUNCH_LATENESS_MS, Date.parse(plan.ownedEnd)));
-    console.log('Automatic block check passed: quality, replay and private archive confirmed.');
-  }, async () => {
-    let uploaded = 0;
-    for (const chunk of plan.chunks) {
-      if (signal.aborted) throw new Error('Study block aborted');
-      await waitUntil(Date.parse(chunk.plannedStart), signal);
-      const seconds = chunkDurationSeconds(chunk, Date.now());
-      if (seconds <= 0) continue;
-      persisted = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
-      assertFrozenRuntime(persisted);
-      if (studyChunkRecorded(persisted, plan, chunk)) continue;
-      const directory = await recordMarket(recorderArguments(workspace, seconds, 'main'), process.cwd());
-      const quality = assessStudyChunk(directory, chunk), identity = readManifestIdentity(directory);
-      const assetName = `study-${plan.sessionDate}-${block}-${String(chunk.index).padStart(2, '0')}-${runId}-${runAttempt}.tar.gz`;
-      const draft: ChunkDraft = { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH, assetName,
-        releaseTag: STUDY_RELEASE_TAG, attemptId, chunkId: `${plan.sessionDate}:${block}:${chunk.index}`,
-        sessionDate: plan.sessionDate, phase: 'DEVELOPMENT', block, chunkIndex: chunk.index,
-        plannedStart: chunk.plannedStart, plannedEnd: chunk.plannedEnd, runId: identity.runId,
-        manifestHash: identity.manifestHash, recordingHash: identity.recordingHash,
-        replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()), quality: quality.status,
-        uploadedAt: new Date().toISOString() };
-      const attempt = persisted.attempts.find(item => item.attemptId === attemptId);
-      if (!attempt?.phase) throw new Error('Persisted study attempt disappeared');
-      draft.phase = attempt.phase;
-      atomicJson(path.join(directory, 'study-chunk-receipt.json'), draft);
-      const archive = await archiveChunk(directory, assetName), archiveHash = sha256File(archive);
-      const asset = await uploadConfirmedAsset(repository, archive);
-      const receipt: StudyChunkReceipt = { ...draft, assetId: asset.id, assetDigest: asset.digest ?? `sha256:${archiveHash}`,
-        assetBytes: asset.size || statSync(archive).size, archiveSha256: archiveHash };
-      await updateRemoteLedger(repository, current => acceptStudyChunk(current, receipt), `Accept ${receipt.chunkId}`);
-      uploaded += 1;
-    }
-    const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
-    return { action: 'CAPTURED' as const, plan, chunks: uploaded, reportPath };
-  });
+  const operation: BlockOperation = { schemaVersion: 1, attemptId, plan, startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(), state: 'STARTING', failure: null, parts: [] };
+  await saveOperation(repository, operation);
+  let stage: BlockOperation['failure'] = 'STARTUP';
+  try {
+    const result = await runAfterBlockCheck(Date.parse(plan.captureNotBefore), signal, async () => {
+      appendStudySummary('Стартовая проверка: запись 60 секунд основной сессии.');
+      await checkedSmoke(workspace, repository, signal,
+        Math.min(Date.parse(plan.ownedStart) + STUDY_LAUNCH_LATENESS_MS, Date.parse(plan.ownedEnd)));
+    }, async () => {
+      operation.state = 'CAPTURING'; await saveOperation(repository, operation);
+      let uploaded = 0;
+      for (const chunk of plan.chunks) {
+        signal.throwIfAborted();
+        await waitUntil(Date.parse(chunk.plannedStart), signal);
+        if (chunkDurationSeconds(chunk, Date.now()) <= 0) continue;
+        stage = 'STORAGE_OR_PROCESSING';
+        persisted = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+        assertFrozenRuntime(persisted);
+        if (studyChunkRecorded(persisted, plan, chunk)) continue;
+        const directory = await recordOwnedSlot({ deadlineMs: Date.parse(chunk.plannedEnd) - STUDY_CHUNK_END_MARGIN_MS, signal,
+          wait: (delay, parent) => waitUntil(Date.now() + delay, parent),
+          attempt: async () => {
+            stage = 'RECORDING';
+            const directory = await recordMarket(studyRecorderArguments(workspace, chunk, Date.now(), signal), process.cwd());
+            const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
+            if (manifest.status !== 'COMPLETE') {
+              stage = 'STORAGE_OR_PROCESSING';
+              const archive = await archiveChunk(directory, `failure-${runId}-${runAttempt}-${chunk.index}-${randomUUID()}.tar.gz`);
+              const asset = await uploadConfirmedAsset(repository, archive);
+              operation.parts.push({ index: chunk.index, status: 'RECORDING_FAILED', assetId: asset.id, quality: null,
+                reasons: [recoverableRecordingFailure(manifest, Date.parse(chunk.plannedEnd) - STUDY_CHUNK_END_MARGIN_MS) ? 'TEMPORARY_METADATA_FAILURE' : 'TERMINAL_RECORDING_FAILURE'] });
+              await saveOperation(repository, operation);
+              appendStudySummary(`Часть ${chunk.index}: запись не завершена; диагностика сохранена приватно.`);
+              if (!recoverableRecordingFailure(manifest, Date.parse(chunk.plannedEnd) - STUDY_CHUNK_END_MARGIN_MS)) { stage = 'RECORDING'; throw new Error('Terminal recording failure'); }
+              return { value: directory, retryable: true };
+            }
+            return { value: directory, retryable: false };
+          } });
+        const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as JsonObject;
+        if (manifest.status !== 'COMPLETE') continue;
+        signal.throwIfAborted(); stage = 'STORAGE_OR_PROCESSING';
+        const quality = assessStudyChunk(directory, chunk), identity = readManifestIdentity(directory);
+        const assetName = `study-${plan.sessionDate}-${block}-${String(chunk.index).padStart(2, '0')}-${runId}-${runAttempt}.tar.gz`;
+        const draft: ChunkDraft = { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH, assetName,
+          releaseTag: STUDY_RELEASE_TAG, attemptId, chunkId: `${plan.sessionDate}:${block}:${chunk.index}`,
+          sessionDate: plan.sessionDate, phase: 'DEVELOPMENT', block, chunkIndex: chunk.index,
+          plannedStart: chunk.plannedStart, plannedEnd: chunk.plannedEnd, runId: identity.runId,
+          manifestHash: identity.manifestHash, recordingHash: identity.recordingHash,
+          replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()), quality: quality.status,
+          uploadedAt: new Date().toISOString() };
+        const attempt = persisted.attempts.find(item => item.attemptId === attemptId);
+        if (!attempt?.phase) throw new Error('Persisted study attempt disappeared');
+        draft.phase = attempt.phase;
+        atomicJson(path.join(directory, 'study-chunk-receipt.json'), draft);
+        const archive = await archiveChunk(directory, assetName), archiveHash = sha256File(archive);
+        const asset = await uploadConfirmedAsset(repository, archive);
+        const receipt: StudyChunkReceipt = { ...draft, assetId: asset.id, assetDigest: asset.digest ?? `sha256:${archiveHash}`,
+          assetBytes: asset.size || statSync(archive).size, archiveSha256: archiveHash };
+        await updateRemoteLedger(repository, current => acceptStudyChunk(current, receipt), `Accept ${receipt.chunkId}`);
+        const reasons = smokeQualityReasons(JSON.parse(readFileSync(path.join(directory, 'summary.json'), 'utf8')) as JsonObject, quality);
+        operation.parts.push({ index: chunk.index, status: 'SAVED', assetId: asset.id, quality: quality.status, reasons });
+        await saveOperation(repository, operation); uploaded += 1;
+        appendStudySummary(`Часть ${chunk.index}: архив подтверждён; качество **${quality.status}**.`
+          + (reasons.length ? `\n\n${reasons.map(reason => `- ${reason}`).join('\n')}` : ''));
+      }
+      const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
+      return { action: 'CAPTURED' as const, plan, chunks: uploaded, reportPath };
+    });
+    operation.state = 'FINISHED'; await saveOperation(repository, operation);
+    return result;
+  } catch (error) {
+    operation.state = signal.aborted ? 'CANCELLED' : 'FAILED'; operation.failure = stage;
+    try { await saveOperation(repository, operation); } catch { /* Preserve the primary failure; uploaded evidence is immutable. */ }
+    appendStudySummary(`Сбор прерван. Этап: ${stage}. Ранее подтверждённые архивы сохранены; полный день не подтверждён.`);
+    throw error;
+  }
 }
 
 async function smoke(workspace: string, repository?: string, captureDeadlineMs?: number): Promise<string> {
@@ -778,10 +874,12 @@ async function observeMorning(workspace: string, repository: string, signal: Abo
   while (stopAt - Date.now() >= 120_000) {
     signal.throwIfAborted();
     const seconds = Math.min(1_800, Math.floor((stopAt - Date.now() - 1_000) / 1_000));
-    const directory = await recordMarket({ ...recorderArguments(workspace, seconds, 'main'), captureDeadlineMs: stopAt }, process.cwd());
+    const directory = await recordMarket({ ...recorderArguments(workspace, seconds, 'main'),
+      captureDeadlineMs: Math.min(stopAt, Date.now() + seconds * 1000), parentSignal: signal }, process.cwd());
     const result = await archiveDiagnosticRecording(directory, stopAt);
     await uploadConfirmedAsset(repository, result.archive);
     uploaded += 1;
+    appendStudySummary(`Диагностическая часть ${uploaded}: запись, обработка и приватный архив завершены. Качество записи: ${result.quality?.status ?? 'FAILED'}. В зачёт дней не входит.`);
     console.log(JSON.stringify({ action: 'DIAGNOSTIC_PART_CONFIRMED', parts: uploaded, counted: false }));
     if (result.status !== 'COMPLETE') throw new Error('Diagnostic recording failed; partial archive preserved');
     if (result.replayFailed) throw new Error('Diagnostic replay failed; raw archive preserved');
@@ -817,6 +915,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       output('action', result.action); console.log(JSON.stringify(result)); return;
     }
     const repository = required(values, '--repo');
+    if (command === 'report') {
+      const dates = await refreshOperationalReports(repository);
+      console.log(JSON.stringify({ action: 'OPERATIONAL_REPORTS_UPDATED', dates })); return;
+    }
     if (command === 'status') {
       const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
       console.log(JSON.stringify({ phase: ledger.phase, attempts: ledger.attempts.length, chunks: ledger.chunks.length, days: ledger.days.length })); return;
@@ -839,7 +941,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected prepare-block, preflight, smoke, observe, run-block, freeze, or status command');
+    throw new Error('Expected prepare-block, preflight, smoke, observe, run-block, freeze, report, or status command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
