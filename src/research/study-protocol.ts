@@ -71,13 +71,13 @@ function utcForMoscowDate(date: string, hour: number, minute: number): number {
   return Date.UTC(Number(parsed[1]), Number(parsed[2]) - 1, Number(parsed[3]), hour - 3, minute);
 }
 
-/** A manually armed job may wait only for today's upcoming preparation window. */
-export function planStudyPreparation(block: StudyBlock, nowMs: number): { sessionDate: string; readyAt: string } {
+/** Manual preparation must be upcoming; delayed schedules defer admission to planStudyBlock. */
+export function planStudyPreparation(block: StudyBlock, nowMs: number, source: 'manual' | 'schedule' = 'manual'): { sessionDate: string; readyAt: string } {
   if (!['early', 'late'].includes(block) || !Number.isFinite(nowMs)) throw new Error('Invalid preparation request');
   const sessionDate = new Date(nowMs + 3 * 3_600_000).toISOString().slice(0, 10);
   const target = utcForMoscowDate(sessionDate, block === 'early' ? 8 : 13, 50);
   const delay = target - nowMs;
-  if (delay <= 0 || delay >= STUDY_JOB_MAX_MS - 120_000) throw new Error('Preparation must be later today and within the bounded job duration');
+  if ((delay <= 0 && source !== 'schedule') || delay >= STUDY_JOB_MAX_MS - 120_000) throw new Error('Preparation must be later today and within the bounded job duration');
   return { sessionDate, readyAt: new Date(target).toISOString() };
 }
 

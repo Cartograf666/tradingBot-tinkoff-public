@@ -31,6 +31,23 @@ test('armed preparation waits for today only within a bounded runner duration', 
   assert.throws(() => assertStudyPreparationReady(preparation, Date.parse('2026-09-15T21:00:00Z')));
 });
 
+test('early and delayed GitHub schedules preserve the original block admission window', () => {
+  const day = '2026-09-16', start = `${day}T06:00:00Z`, end = `${day}T15:54:59Z`;
+  for (const block of ['early', 'late'] as const) {
+    const hour = block === 'early' ? '05' : '10';
+    const preparation = planStudyPreparation(block, Date.parse(`${day}T${hour}:20:00Z`), 'schedule');
+    assert.equal(preparation.readyAt, `${day}T${hour}:50:00.000Z`);
+    const delayed = Date.parse(`${day}T${hour}:55:00Z`);
+    assert.deepEqual(planStudyPreparation(block, delayed, 'schedule'), preparation);
+    assert.ok(planStudyBlock(day, start, end, block, delayed));
+    const missed = Date.parse(`${day}T15:00:00Z`);
+    assert.deepEqual(planStudyPreparation(block, missed, 'schedule'), preparation);
+    assert.equal(planStudyBlock(day, start, end, block, missed), null);
+    assert.throws(() => planStudyPreparation(block, delayed), /later today/);
+  }
+  assert.throws(() => planStudyPreparation('late', Date.parse(`${day}T00:00:00Z`), 'schedule'), /bounded job duration/);
+});
+
 test('fresh API session is split into two complete ownership blocks and <=30 minute chunks', () => {
   const start = '2026-09-14T06:00:00.000Z', end = '2026-09-14T15:54:59.000Z';
   const early = planStudyBlock('2026-09-14', start, end, 'early', Date.parse('2026-09-14T05:50:00Z'))!;

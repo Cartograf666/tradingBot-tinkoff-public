@@ -1,8 +1,0 @@
-{
-  "name": "market-study-watchdog",
-  "main": "src.js",
-  "compatibility_date": "2026-09-16",
-  "workers_dev": true,
-  "triggers": { "crons": ["*/5 5-16 * * 1-5"] },
-  "vars": { "WATCHDOG_ENABLED": "false" }
-}

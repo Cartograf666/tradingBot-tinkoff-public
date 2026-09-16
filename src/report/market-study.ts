@@ -894,7 +894,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   try {
     if (command === 'prepare-block') {
       const block = required(values, '--block');
-      const preparation = planStudyPreparation(block as StudyBlock, Date.now());
+      const preparation = planStudyPreparation(block as StudyBlock, Date.now(),
+        process.env.GITHUB_EVENT_NAME === 'schedule' ? 'schedule' : 'manual');
       console.log(JSON.stringify({ action: 'WAITING_FOR_BLOCK', block, ...preparation }));
       await waitUntil(Date.parse(preparation.readyAt), controller.signal);
       controller.signal.throwIfAborted();

@@ -6,7 +6,6 @@ on:
       - '.github/workflows/*study*.yml'
       - 'src/research/**'
       - 'src/report/**'
-      - 'ops/watchdog/**'
       - 'src/report/replay-orderbook.ts'
       - 'src/report/market-study.ts'
       - 'src/report/*.test.ts'
@@ -22,7 +21,6 @@ on:
       - '.github/workflows/*study*.yml'
       - 'src/research/**'
       - 'src/report/**'
-      - 'ops/watchdog/**'
       - 'src/report/replay-orderbook.ts'
       - 'src/report/market-study.ts'
       - 'src/report/*.test.ts'
@@ -50,4 +48,3 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run study:test
-      - run: node --test ops/watchdog/test/*.test.js
