@@ -122,3 +122,18 @@ test('slot retries respect deadline, cancellation and failures saving evidence',
   await assert.rejects(recordOwnedSlot({ ...options, signal: c.signal }));
   assert.equal(calls, 1);
 });
+
+test('continuous liveness uses confirmed checkpoint cadence and distinguishes processing', () => {
+  const op = { ...operation(), captureFormat: 'continuous-v2' as const, checkpointIntervalMs: 300_000,
+    captureStartedAt: `${reportDate}T12:05:00Z`, checkpoints: [{ index: 1, assetId: 900,
+      lastReceivedAt: `${reportDate}T12:10:00Z`, confirmedAt: `${reportDate}T12:10:04Z` }] };
+  const live = runtime([activeRun]);
+  const day = operationalDay(createStudyLedger(), [op], reportDate, reportNow, live);
+  assert.equal(day.collector.nextExpectedUploadAt, `${reportDate}T12:18:00.000Z`);
+  assert.equal(day.state, 'PARTIAL_DATA'); assert.equal(day.confirmedCheckpoints, 1);
+  assert.equal(day.passingParts, 0); assert.equal(day.fullDayAccepted, false);
+  assert.equal(collectorStatus([op], reportDate, Date.parse(`${reportDate}T12:19:00Z`), live).status, 'UPLOAD_OVERDUE');
+  assert.equal(collectorStatus([{ ...op, recordingStoppedAt: `${reportDate}T12:11:00Z` }], reportDate,
+    Date.parse(`${reportDate}T12:19:00Z`), live).status, 'PROCESSING');
+  assert.equal(collectorStatus([op], reportDate, reportNow, runtime()).status, 'STOPPED');
+});

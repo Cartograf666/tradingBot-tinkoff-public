@@ -7,12 +7,19 @@ import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { InstrumentIdType } from 'tinkoff-invest-api/dist/generated/instruments.js';
 import { OrderBookType, TradeSourceType, SubscriptionAction } from 'tinkoff-invest-api/dist/generated/marketdata.js';
 import { getTinkoffClientOptions } from '../core/tinkoff-client.js';
-import { RecordingWriter } from '../research/market-recording.js';
+import { RecordingWriter, type ClosedRecordingSegment } from '../research/market-recording.js';
+import { CheckpointQueue, CheckpointQueueError } from '../research/checkpoint-queue.js';
 import { captureMarketStream } from '../research/market-recorder.js';
 import { reportMarketRecording } from '../research/market-recording-report.js';
 import { captureDeadlineSignal, classifyMetadataError, MetadataRequestFailure, retryMetadata, type MetadataDiagnostic, type MetadataOperation } from './metadata-retry.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { normalizeIntervals, observationSubscriptions, subscriptionAcknowledgments, type ObservationManifest, type RequestedSource } from '../research/market-observation.js';
+
+export interface RecorderCheckpoint {
+  directory: string;
+  segment: ClosedRecordingSegment;
+  manifest: ObservationManifest;
+}
 
 export interface RecorderArguments {
   seconds: number; tickers: string[]; source: RequestedSource; depth: number;
@@ -21,6 +28,11 @@ export interface RecorderArguments {
   captureDeadlineMs?: number;
   parentSignal?: AbortSignal;
   setExitCodeOnFailure?: boolean;
+  checkpointIntervalMs?: number;
+  onCheckpoint?: (checkpoint: RecorderCheckpoint, signal: AbortSignal) => Promise<void>;
+  checkpointMaxPending?: number;
+  checkpointUploadTimeoutMs?: number;
+  checkpointDrainTimeoutMs?: number;
 }
 
 export function boundedCaptureDuration(requestedMs: number, nowMs: number, deadlineMs?: number): number {
@@ -66,10 +78,20 @@ export function captureCompletionReason(reason: string, userAborted: boolean, no
   return reason === 'aborted' && !userAborted && deadlineMs !== undefined && nowMs >= deadlineMs ? 'duration' : reason;
 }
 
+/** Normalize the actual terminal event before it becomes immutable/hash-bound. */
+export function normalizeCaptureStop(payload: unknown, userAborted: boolean, nowMs: number, deadlineMs?: number): { reason: string; [key: string]: unknown } {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof (payload as { reason?: unknown }).reason !== 'string') {
+    throw new Error('Invalid capture stop payload');
+  }
+  const stop = payload as { reason: string; [key: string]: unknown };
+  return { ...stop, reason: captureCompletionReason(stop.reason, userAborted, nowMs, deadlineMs) };
+}
+
 export function recorderFailure(error: unknown, stage: string): {
   code: number | null; stage: string; category: string; retryable: boolean;
   operation?: MetadataOperation; attempt?: number;
 } {
+  if (error instanceof CheckpointQueueError) return { code: null, stage: 'checkpoint', category: error.category, retryable: false };
   const diagnostic = error instanceof MetadataRequestFailure ? error.diagnostic : classifyMetadataError(error);
   const retryable = stage === 'metadata' && ['TIMEOUT', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(diagnostic.classification);
   return { code: diagnostic.code, stage, category: diagnostic.classification, retryable,
@@ -84,6 +106,9 @@ function writeJson(file: string, value: unknown): void {
 }
 
 export async function recordMarket(args: RecorderArguments, root: string): Promise<string> {
+  if (args.onCheckpoint && args.checkpointIntervalMs === undefined && args.segmentMaxBytes === undefined) {
+    throw new Error('Checkpoint capture requires temporal or size segmentation');
+  }
   boundedCaptureDuration(args.seconds * 1000, Date.now(), args.captureDeadlineMs);
   // Do not import application config: it starts unrelated validation/logging and can exit the process.
   const local = existsSync(path.join(root, '.env')) ? dotenv.parse(readFileSync(path.join(root, '.env'))) : {};
@@ -94,7 +119,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   const directory = path.join(args.outputDir, `${new Date().toISOString().replaceAll(':', '-')}-${runId.slice(0, 8)}`);
   mkdirSync(args.outputDir, { recursive: true }); mkdirSync(directory, { mode: 0o700 });
   const files = ['src/report/record-market.ts', 'src/report/metadata-retry.ts', 'src/research/market-recorder.ts', 'src/research/market-recording.ts',
-    'src/research/market-observation.ts', 'src/research/market-recording-report.ts', 'src/research/order-book-costs.ts',
+    'src/research/market-observation.ts', 'src/research/checkpoint-queue.ts', 'src/research/market-recording-report.ts', 'src/research/order-book-costs.ts',
     'src/research/observation-session.ts', 'src/core/tinkoff-client.ts', 'certs/russian-trusted-root-ca.pem', 'package-lock.json'];
   const codeHashes = Object.fromEntries(files.map(file => [file, createHash('sha256').update(readFileSync(path.join(root, file))).digest('hex')]));
   const manifest: ObservationManifest = {
@@ -114,6 +139,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
       'This finite run does not schedule future collection or start any trading strategy.',
     ],
   };
+  if (args.checkpointIntervalMs !== undefined) manifest.notes.push(`Closed immutable checkpoint interval: ${args.checkpointIntervalMs}ms; one continuous run.`);
   const manifestFile = path.join(directory, 'manifest.json'); writeJson(manifestFile, manifest);
   const api = new ObservationApi(options), controller = new AbortController();
   const stop = () => controller.abort();
@@ -124,6 +150,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   if (args.parentSignal?.aborted) onParentAbort();
   const captureBound = captureDeadlineSignal(args.captureDeadlineMs, controller.signal);
   let writer: RecordingWriter | undefined, stage = 'metadata';
+  let checkpointQueue: CheckpointQueue<RecorderCheckpoint> | undefined;
   const metadataDiagnostics: MetadataDiagnostic[] = [];
   const metadata = <T>(operation: MetadataOperation, request: (signal: AbortSignal) => Promise<T>) => retryMetadata(request, {
     operation, signal: controller.signal, deadlineMs: args.captureDeadlineMs,
@@ -133,6 +160,10 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
     },
   });
   try {
+    checkpointQueue = args.onCheckpoint ? new CheckpointQueue<RecorderCheckpoint>({
+      upload: args.onCheckpoint, onFailure: error => controller.abort(error),
+      maxPending: args.checkpointMaxPending, uploadTimeoutMs: args.checkpointUploadTimeoutMs,
+    }) : undefined;
     const shares = [];
     for (const ticker of args.tickers) {
       const { instrument: i } = await metadata('shareBy', signal => api.instruments.shareBy({ idType: InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER, id: ticker, classCode: 'TQBR' }, { signal }));
@@ -167,8 +198,13 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
     }
     manifest.status = 'RECORDING'; writeJson(manifestFile, manifest);
     stage = 'stream';
+    // All checkpoints use the same frozen metadata; final status/hash are committed only after capture.
+    const checkpointManifest = structuredClone(manifest);
     writer = new RecordingWriter({ path: path.join(directory, 'events.ndjson'), runId, maxBytes: args.maxBytes,
-      segmentMaxBytes: args.segmentMaxBytes, fsyncEveryMs: manifest.settings.fsyncEveryMs });
+      segmentMaxBytes: args.segmentMaxBytes, fsyncEveryMs: manifest.settings.fsyncEveryMs,
+      checkpointIntervalMs: args.checkpointIntervalMs,
+      onSegmentClosed: checkpointQueue ? segment => checkpointQueue!.enqueue({ directory, segment,
+        manifest: structuredClone(checkpointManifest) }) : undefined });
     const source = args.source === 'exchange' ? OrderBookType.ORDERBOOK_TYPE_EXCHANGE : args.source === 'dealer' ? OrderBookType.ORDERBOOK_TYPE_DEALER : OrderBookType.ORDERBOOK_TYPE_ALL;
     const tapeSource = args.source === 'exchange' ? TradeSourceType.TRADE_SOURCE_EXCHANGE : args.source === 'dealer' ? TradeSourceType.TRADE_SOURCE_DEALER : TradeSourceType.TRADE_SOURCE_ALL;
     const subscribe = SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE;
@@ -179,6 +215,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
       pingSettings: { pingDelayMs: 5000 },
     };
     const activeWriter = writer;
+    let recordedStopReason: string | undefined;
     manifest.capture = await captureMarketStream({
       openStream: async function* (signal) {
         const response = await api.marketdata.getTradingStatuses({ instrumentId: manifest.instruments.map(i => i.uid) },
@@ -187,15 +224,24 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
         yield { observationOrigin: 'UNARY_GET_TRADING_STATUSES', response };
         yield* api.marketdataStream.marketDataServerSideStream(request, { signal });
       },
-      record: (kind, payload, epoch) => activeWriter.append(kind, payload, epoch),
+      record: (kind, payload, epoch) => {
+        checkpointQueue?.throwIfFailed();
+        if (kind === 'stop') {
+          const stopPayload = normalizeCaptureStop(payload, controller.signal.aborted, Date.now(), args.captureDeadlineMs);
+          activeWriter.append(kind, stopPayload, epoch);
+          recordedStopReason = stopPayload.reason;
+        } else activeWriter.append(kind, payload, epoch);
+      },
       expectedSubscriptions: observationSubscriptions(manifest.instruments),
       acknowledgments: payload => subscriptionAcknowledgments(payload, args.source, args.depth),
       durationMs: manifest.settings.durationMs, subscriptionTimeoutMs: manifest.settings.subscriptionTimeoutMs,
       heartbeatTimeoutMs: manifest.settings.heartbeatTimeoutMs, tickIntervalMs: manifest.settings.sampleIntervalMs,
       maxReconnects: manifest.settings.maxReconnects, backoffMs: [1000, 2000, 5000, 10000, 20000], signal: captureBound.signal,
     });
-    manifest.capture.reason = captureCompletionReason(manifest.capture.reason, controller.signal.aborted, Date.now(), args.captureDeadlineMs);
+    // Use the reason already committed to raw storage; later aborts must not change its meaning.
+    manifest.capture.reason = recordedStopReason ?? manifest.capture.reason;
     manifest.recording = writer.close(); writer = undefined;
+    if (checkpointQueue) { stage = 'checkpoint'; await checkpointQueue.drain(args.checkpointDrainTimeoutMs); }
     manifest.status = ['duration', 'aborted', 'duration_elapsed', 'external_abort'].includes(manifest.capture.reason.toLowerCase()) ? 'COMPLETE' : 'FAILED';
     manifest.completedAt = new Date().toISOString(); writeJson(manifestFile, manifest);
     stage = 'report';
@@ -208,6 +254,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   } catch (error) {
     controller.abort();
     if (writer) { try { manifest.recording = writer.close(); } catch { /* Integrity will be checked from the partial file. */ } }
+    if (checkpointQueue) { try { await checkpointQueue.drain(args.checkpointDrainTimeoutMs); } catch { /* Preserve the original acquisition/upload failure. */ } }
     manifest.status = 'FAILED'; manifest.completedAt = new Date().toISOString();
     manifest.failure = recorderFailure(error, stage); writeJson(manifestFile, manifest);
     if (existsSync(path.join(directory, 'events.ndjson')) && stage !== 'report') {

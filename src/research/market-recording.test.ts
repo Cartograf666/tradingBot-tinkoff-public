@@ -338,3 +338,51 @@ test('scan rejects an unterminated line before buffering it without bound', asyn
   writeFileSync(recordingPath, Buffer.alloc(4 * 1024 * 1024 + 1, 0x78));
   await assert.rejects(scanRecording(recordingPath), /line 1 exceeds/);
 });
+
+test('temporal checkpoints retain exact continuous raw events and publish only immutable nonempty files', async t => {
+  let monotonic = 0n;
+  t.mock.method(process.hrtime, 'bigint', () => monotonic);
+  const recordingPath = temporaryPath('temporal.ndjson');
+  const closed: import('./market-recording.js').ClosedRecordingSegment[] = [];
+  const capturedBytes: Buffer[] = [];
+  const writer = new RecordingWriter({ path: recordingPath, runId: 'continuous', checkpointIntervalMs: 100,
+    onSegmentClosed: segment => {
+      assert.equal(Object.isFrozen(segment), true);
+      closed.push(segment);
+      capturedBytes.push(readFileSync(path.join(path.dirname(recordingPath), segment.file)));
+    } });
+  writer.append('connect_attempt', { attempt: 1 }, 1);
+  monotonic = 99_000_000n; writer.append('response', { ack: true }, 1);
+  assert.equal(closed.length, 0);
+  monotonic = 100_000_000n; writer.append('tick', {}, 1);
+  monotonic = 250_000_000n; writer.append('response', { book: 'fresh' }, 1);
+  writer.append('stop', { reason: 'duration' }, 1);
+  const summary = writer.close();
+  assert.equal(closed.length, 3);
+  assert.deepEqual(closed.map(segment => [segment.firstSequence, segment.lastSequence]), [[1, 2], [3, 3], [4, 5]]);
+  const events: RecordedEvent[] = [];
+  const scanned = await scanRecording(recordingPath, event => { events.push(event); }, summary.segments);
+  assert.equal(scanned.sha256, summary.sha256);
+  assert.equal(createHash('sha256').update(Buffer.concat(capturedBytes)).digest('hex'), summary.sha256);
+  assert.deepEqual(events.map(event => event.kind), ['connect_attempt', 'response', 'tick', 'response', 'stop']);
+  assert.deepEqual(events.map(event => event.connectionEpoch), [1, 1, 1, 1, 1]);
+  for (let index = 0; index < closed.length; index += 1) {
+    assert.deepEqual(readFileSync(path.join(path.dirname(recordingPath), closed[index].file)), capturedBytes[index]);
+  }
+});
+
+test('an empty recording emits no phantom checkpoint and a callback failure retains durable bytes', () => {
+  const emptyPath = temporaryPath('empty-checkpoint.ndjson');
+  const empty = new RecordingWriter({ path: emptyPath, runId: 'empty', checkpointIntervalMs: 10,
+    onSegmentClosed: () => assert.fail('Empty checkpoint was emitted') });
+  assert.equal(empty.close().events, 0);
+  const recordingPath = temporaryPath('failed-checkpoint.ndjson');
+  const writer = new RecordingWriter({ path: recordingPath, runId: 'failure', segmentMaxBytes: 400,
+    onSegmentClosed: () => { throw new Error('storage failed'); } });
+  writer.append('response', { raw: 'x'.repeat(90) }, 1);
+  assert.throws(() => writer.append('response', { raw: 'x'.repeat(90) }, 1), /storage failed/);
+  const summary = writer.close();
+  assert.equal(summary.events, 1);
+  assert.equal(summary.segments?.length, 1);
+  assert.equal(summary.bytes, readFileSync(recordingPath).length);
+});

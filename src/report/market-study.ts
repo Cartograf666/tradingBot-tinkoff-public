@@ -1,3 +1,6 @@
+import { prepareContinuousCheckpoint, restoreContinuousCheckpoints } from '../research/continuous-checkpoints.js';
+import { assessContinuousWindows } from '../research/continuous-windows.js';
+import type { ObservationManifest } from '../research/market-observation.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -6,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { TINKOFF_SANDBOX_ENDPOINT } from '../core/tinkoff-client.js';
+import { confirmImmutableAsset } from './immutable-asset.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
 import { closedPlansNeedingFinalization, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
 import { readStudyRuntime } from './study-runtime.js';
@@ -27,9 +31,9 @@ type ExecResult = { stdout: Buffer; stderr: Buffer };
 const STATE_PATH = 'study-ledger.json';
 const README_PATH = 'README.md';
 
-function runFile(command: string, args: string[], options: { cwd?: string; maxBuffer?: number } = {}): Promise<ExecResult> {
+function runFile(command: string, args: string[], options: { cwd?: string; maxBuffer?: number; signal?: AbortSignal } = {}): Promise<ExecResult> {
   return new Promise((resolve, reject) => execFile(command, args, {
-    cwd: options.cwd, encoding: 'buffer', maxBuffer: options.maxBuffer ?? 512 * 1024 * 1024,
+    cwd: options.cwd, signal: options.signal, timeout: 90_000, encoding: 'buffer', maxBuffer: options.maxBuffer ?? 512 * 1024 * 1024,
     env: process.env,
   }, (error, stdout, stderr) => error ? reject(Object.assign(error, { stdout, stderr })) : resolve({ stdout, stderr })));
 }
@@ -65,8 +69,8 @@ function ghErrorStatus(error: unknown): number | null {
   const match = /HTTP\s+(\d{3})/i.exec(text);
   return match ? Number(match[1]) : null;
 }
-async function ghJson(args: string[]): Promise<JsonObject> {
-  const { stdout } = await runFile('gh', args); return JSON.parse(stdout.toString('utf8')) as JsonObject;
+async function ghJson(args: string[], signal?: AbortSignal): Promise<JsonObject> {
+  const { stdout } = await runFile('gh', args, { signal }); return JSON.parse(stdout.toString('utf8')) as JsonObject;
 }
 export async function ensureStateBranch(repository: string, request: (args: string[]) => Promise<JsonObject> = ghJson): Promise<void> {
   const repo = await request(['api', `/repos/${repository}`]);
@@ -363,12 +367,13 @@ async function ensureDraftRelease(repository: string): Promise<void> {
   if (!await findDraftRelease(repository)) throw new Error('Created archive draft was not confirmed');
 }
 interface ReleaseAsset { id: number; name: string; size: number; digest?: string }
-async function releaseAssets(repository: string): Promise<ReleaseAsset[]> {
+async function releaseAssets(repository: string, signal?: AbortSignal): Promise<ReleaseAsset[]> {
   const release = await findDraftRelease(repository);
   if (!release) throw new Error('Archive draft is missing from the release inventory');
   const result: ReleaseAsset[] = [];
-  for (let page = 1; page <= 10; page += 1) {
-    const response = await ghJson(['api', `/repos/${repository}/releases/${Number(release.id)}/assets?per_page=100&page=${page}`]);
+  for (let page = 1; page <= 200; page += 1) {
+    signal?.throwIfAborted();
+    const response = await ghJson(['api', `/repos/${repository}/releases/${Number(release.id)}/assets?per_page=100&page=${page}`], signal);
     if (!Array.isArray(response)) throw new Error('Invalid release asset page');
     for (const raw of response as JsonObject[]) {
       const asset = { id: Number(raw.id), name: String(raw.name), size: Number(raw.size),
@@ -380,31 +385,30 @@ async function releaseAssets(repository: string): Promise<ReleaseAsset[]> {
     }
     if (response.length < 100) return result;
   }
-  throw new Error('Draft release reached its supported 1000-asset inventory');
+  throw new Error('Draft release reached its supported 20000-asset inventory');
 }
-async function downloadAsset(repository: string, assetId: number, destination: string): Promise<void> {
+async function downloadAsset(repository: string, assetId: number, destination: string, signal?: AbortSignal): Promise<void> {
   const { stdout } = await runFile('gh', ['api', '-H', 'Accept: application/octet-stream',
-    `/repos/${repository}/releases/assets/${assetId}`]);
+    `/repos/${repository}/releases/assets/${assetId}`], { signal });
   writeFileSync(destination, stdout, { mode: 0o600 });
 }
-async function uploadConfirmedAsset(repository: string, archive: string): Promise<ReleaseAsset> {
+async function uploadConfirmedAsset(repository: string, archive: string, signal?: AbortSignal): Promise<ReleaseAsset> {
+  signal?.throwIfAborted();
   await ensureDraftRelease(repository);
-  await runFile('gh', ['release', 'upload', STUDY_RELEASE_TAG, archive, '--repo', repository]);
-  const asset = (await releaseAssets(repository)).find(item => item.name === path.basename(archive));
-  if (!asset) throw new Error('Uploaded release asset was not confirmed');
-  const expected = `sha256:${sha256File(archive)}`;
-  if (asset.digest && asset.digest !== expected) throw new Error('Remote release asset digest differs from local archive');
-  if (!asset.digest) {
-    const downloaded = path.join(tmpdir(), `market-study-verify-${asset.id}.tar.gz`);
-    await downloadAsset(repository, asset.id, downloaded);
-    if (sha256File(downloaded) !== expected.slice(7)) throw new Error('Downloaded release asset differs from local archive');
-    unlinkSync(downloaded);
-  }
-  return asset;
+  return confirmImmutableAsset({ name: path.basename(archive), bytes: statSync(archive).size, sha256: sha256File(archive) }, {
+    find: async () => (await releaseAssets(repository, signal)).find(item => item.name === path.basename(archive)),
+    upload: async () => { await runFile('gh', ['release', 'upload', STUDY_RELEASE_TAG, archive, '--repo', repository], { signal }); },
+    downloadedHash: async asset => {
+      const downloaded = path.join(tmpdir(), `market-study-verify-${randomUUID()}.tar.gz`);
+      try { await downloadAsset(repository, asset.id, downloaded, signal); return sha256File(downloaded); }
+      finally { rmSync(downloaded, { force: true }); }
+    },
+  }, signal);
 }
 
 interface ChunkDraft extends Omit<StudyChunkReceipt, 'assetId' | 'assetDigest' | 'assetBytes' | 'archiveSha256'> {
   collection?: RecoveryCollectionMetadata;
+  acquisitionPolicyHash?: string;
 }
 interface RecoveryCollectionMetadata {
   mode: 'RECOVERY'; requestedBlock: StudyBlock; selectedAt: string; partialStart: boolean;
@@ -424,13 +428,13 @@ function readManifestIdentity(directory: string): { runId: string; manifestHash:
   if (typeof manifest.runId !== 'string' || typeof recording?.sha256 !== 'string') throw new Error('Completed chunk identity is missing');
   return { runId: manifest.runId, manifestHash: createHash('sha256').update(bytes).digest('hex'), recordingHash: recording.sha256 };
 }
-async function archiveChunk(directory: string, name: string, companion?: string): Promise<string> {
+async function archiveChunk(directory: string, name: string, companion?: string, signal?: AbortSignal): Promise<string> {
   const archive = path.join(path.dirname(directory), name);
   if (companion && path.dirname(path.resolve(companion)) !== path.dirname(path.resolve(directory))) {
     throw new Error('Archive companion must be beside the recording');
   }
   await runFile('tar', ['-czf', archive, '-C', path.dirname(directory), path.basename(directory),
-    ...(companion ? [path.basename(companion)] : [])]);
+    ...(companion ? [path.basename(companion)] : [])], { signal });
   return archive;
 }
 export async function waitUntil(when: number, signal: AbortSignal): Promise<void> {
@@ -544,7 +548,7 @@ export async function reconcileReleaseAssets(repository: string): Promise<StudyL
   return current;
 }
 
-async function materializeAsset(repository: string, receipt: StudyChunkReceipt, workspace: string): Promise<string> {
+export async function materializeAsset(repository: string, receipt: StudyChunkReceipt, workspace: string): Promise<string> {
   const asset = (await releaseAssets(repository)).find(item => item.id === receipt.assetId);
   if (!asset || asset.name !== receipt.assetName || asset.size !== receipt.assetBytes) throw new Error('Canonical release asset metadata changed');
   const archive = path.join(workspace, asset.name);
@@ -560,11 +564,31 @@ async function materializeAsset(repository: string, receipt: StudyChunkReceipt, 
   await runFile('tar', ['-xzf', archive, '-C', workspace]);
   const directory = realpathSync(path.join(workspace, root));
   if (!directory.startsWith(`${realpathSync(workspace)}${path.sep}`)) throw new Error('Chunk extraction escaped its workspace');
-  const identity = readManifestIdentity(directory);
+  let recordingDirectory = directory;
+  const referencePath = path.join(directory, 'continuous-reference.json');
+  if (existsSync(referencePath)) {
+    const reference = JSON.parse(readFileSync(referencePath, 'utf8')) as ContinuousReference;
+    if (reference.schemaVersion !== 1 || reference.kind !== 'CONTINUOUS_WINDOW'
+      || reference.acquisitionPolicyHash !== CONTINUOUS_CAPTURE_POLICY_HASH || reference.runId !== receipt.runId
+      || reference.manifestHash !== receipt.manifestHash || reference.recordingHash !== receipt.recordingHash) {
+      throw new Error('Continuous window reference identity differs from receipt');
+    }
+    recordingDirectory = await extractContinuousAsset(repository, reference.source, workspace);
+  }
+  const identity = readManifestIdentity(recordingDirectory);
   if (identity.manifestHash !== receipt.manifestHash || identity.recordingHash !== receipt.recordingHash) {
     throw new Error('Extracted chunk identity differs from its immutable receipt');
   }
-  return directory;
+  return recordingDirectory;
+}
+
+export async function materializeStudyInputs(repository: string, receipts: StudyChunkReceipt[], workspace: string): Promise<string[]> {
+  const directories: string[] = [];
+  for (const receipt of receipts) {
+    const directory = await materializeAsset(repository, receipt, workspace);
+    if (!directories.includes(directory)) directories.push(directory);
+  }
+  return directories;
 }
 
 function expectedChunkIds(plan: StudyBlockPlan): string[] {
@@ -598,8 +622,7 @@ export async function maybeFinalizeStudyDay(repository: string, plan: StudyBlock
   const materialized = mkdtempSync(path.join(path.resolve(workspace), `day-${plan.sessionDate}-`));
   const outputDirectory = path.join(materialized, 'replay');
   try {
-    const directories: string[] = [];
-    for (const receipt of receipts) directories.push(await materializeAsset(repository, receipt, materialized));
+    const directories = await materializeStudyInputs(repository, receipts, materialized);
     const report = await replaySession(directories, outputDirectory, { sessionDate: plan.sessionDate,
       mainStart: plan.mainStart, mainEnd: plan.mainEnd });
     const sourceHashes = replaySourceHashes(process.cwd());
@@ -688,6 +711,8 @@ export async function refreshOperationalReports(repository: string): Promise<num
   let replayFailures = 0;
   const recoveryWorkspace = mkdtempSync(path.join(tmpdir(), 'market-study-report-'));
   try {
+    replayFailures += await reconcileContinuousBlocks(repository, recoveryWorkspace);
+    ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
     for (const plan of closedPlansNeedingFinalization(ledger, operations)) {
       try { await maybeFinalizeStudyDay(repository, plan, recoveryWorkspace); }
       catch {
@@ -930,6 +955,270 @@ async function observeMorning(workspace: string, repository: string, signal: Abo
   return { action: 'DIAGNOSTIC_COMPLETE', parts: uploaded, stopAt: new Date(stopAt).toISOString(), counted: false };
 }
 
+interface ContinuousAssetIdentity {
+  assetId: number; assetName: string; assetBytes: number; assetDigest: string; archiveSha256: string;
+}
+interface ContinuousBlockDraft {
+  schemaVersion: 1; kind: 'CONTINUOUS_BLOCK'; acquisitionPolicyHash: string;
+  attemptId: string; diagnosticOnly: boolean; plan: StudyBlockPlan | null;
+  phase: 'DEVELOPMENT' | 'HOLDOUT' | null;
+  replayConfigHash: string; simulatorHashes: Record<string, string>;
+  checkpoints: Array<ContinuousAssetIdentity & { index: number; checkpointHash: string; lastReceivedAt: string }>;
+}
+interface ContinuousReference {
+  schemaVersion: 1; kind: 'CONTINUOUS_WINDOW'; acquisitionPolicyHash: string;
+  source: ContinuousAssetIdentity; runId: string; manifestHash: string; recordingHash: string;
+}
+// Acquisition v2 supersedes v1's separate quality-gated smoke and per-window reconnects.
+// The scientific ledger and its frozen 99%/80% criteria remain compatible and immutable.
+export const continuousCapturePolicy = {
+  version: 2, intervalMs: 300_000, maxPendingCheckpoints: 2, uploadDeadlineMs: 120_000,
+  rawRunScope: 'owned-block', startup: 'in-band-subscription-health',
+  qualityFailure: 'archive-and-continue', scientificWindows: 'original-30-minute-bounds',
+} as const;
+export const CONTINUOUS_CAPTURE_POLICY_HASH = hashStudyValue(continuousCapturePolicy);
+function continuousAsset(asset: ReleaseAsset, archive: string): ContinuousAssetIdentity {
+  const archiveSha256 = sha256File(archive);
+  return { assetId: asset.id, assetName: asset.name, assetBytes: asset.size,
+    assetDigest: asset.digest ?? `sha256:${archiveSha256}`, archiveSha256 };
+}
+function validateContinuousAsset(value: ContinuousAssetIdentity): void {
+  if (!Number.isSafeInteger(value.assetId) || value.assetId <= 0 || !Number.isSafeInteger(value.assetBytes) || value.assetBytes <= 0
+    || !/^[a-zA-Z0-9_.-]+\.tar\.gz$/.test(value.assetName) || !/^[a-f0-9]{64}$/.test(value.archiveSha256)
+    || value.assetDigest !== `sha256:${value.archiveSha256}`) throw new Error('Invalid continuous asset identity');
+}
+async function extractContinuousAsset(repository: string, source: ContinuousAssetIdentity, workspace: string): Promise<string> {
+  validateContinuousAsset(source);
+  const destination = path.join(workspace, `continuous-asset-${source.assetId}`);
+  const marker = path.join(destination, '.verified.json');
+  if (existsSync(marker)) {
+    const cached = JSON.parse(readFileSync(marker, 'utf8')) as { sha256: string; root: string };
+    if (cached.sha256 !== source.archiveSha256 || path.basename(cached.root) !== cached.root) throw new Error('Continuous cache identity conflict');
+    return realpathSync(path.join(destination, cached.root));
+  }
+  mkdirSync(destination);
+  const archive = path.join(destination, source.assetName);
+  await downloadAsset(repository, source.assetId, archive);
+  if (statSync(archive).size !== source.assetBytes || sha256File(archive) !== source.archiveSha256) throw new Error('Continuous source archive changed');
+  const listed = await runFile('tar', ['-tzf', archive], { maxBuffer: 16 * 1024 * 1024 });
+  const entries = safeArchiveEntries(listed.stdout.toString('utf8'));
+  const roots = [...new Set(entries.map(entry => entry.split('/')[0]).filter(Boolean))];
+  if (roots.length !== 1) throw new Error('Continuous archive requires one root');
+  await runFile('tar', ['-xzf', archive, '-C', destination]);
+  const directory = realpathSync(path.join(destination, roots[0]));
+  if (!directory.startsWith(`${realpathSync(destination)}${path.sep}`)) throw new Error('Continuous extraction escaped workspace');
+  atomicJson(marker, { sha256: source.archiveSha256, root: roots[0] });
+  return directory;
+}
+
+/** Capture never waits for a previous segment's archive. The recorder owns bounded backpressure. */
+async function recordContinuousStudy(repository: string, workspace: string, args: RecorderArguments,
+  draft: Omit<ContinuousBlockDraft, 'checkpoints'>, operation?: BlockOperation) {
+  let previousCheckpointHash: string | null = null;
+  const checkpoints: ContinuousBlockDraft['checkpoints'] = [];
+  const checkpointDirectories: string[] = [];
+  const directory = await recordMarket({ ...args, maxBytes: 1024 * 1024 * 1024,
+    checkpointIntervalMs: args.checkpointIntervalMs ?? continuousCapturePolicy.intervalMs,
+    checkpointMaxPending: continuousCapturePolicy.maxPendingCheckpoints,
+    checkpointUploadTimeoutMs: continuousCapturePolicy.uploadDeadlineMs,
+    checkpointDrainTimeoutMs: continuousCapturePolicy.uploadDeadlineMs,
+    onCheckpoint: async (checkpoint, signal) => {
+      const checkpointDirectory = path.join(path.resolve(workspace), `checkpoint-${checkpoint.manifest.runId}-${checkpoint.segment.index}`);
+      const prepared = prepareContinuousCheckpoint(checkpoint.directory, checkpoint.segment,
+        { ...draft, protocolHash: STUDY_PROTOCOL_HASH }, previousCheckpointHash, checkpointDirectory, checkpoint.manifest);
+      const name = `checkpoint-${checkpoint.manifest.runId}-${String(checkpoint.segment.index).padStart(6, '0')}.tar.gz`;
+      const archive = await archiveChunk(prepared.directory, name, undefined, signal);
+      const asset = await uploadConfirmedAsset(repository, archive, signal);
+      checkpoints.push({ ...continuousAsset(asset, archive), index: checkpoint.segment.index,
+        checkpointHash: prepared.checkpointHash, lastReceivedAt: checkpoint.segment.lastReceivedAt });
+      previousCheckpointHash = prepared.checkpointHash;
+      checkpointDirectories.push(prepared.directory);
+      if (operation) {
+        operation.checkpoints = checkpoints.map(item => ({ index: item.index, assetId: item.assetId,
+          lastReceivedAt: item.lastReceivedAt, confirmedAt: new Date().toISOString() }));
+        const current = operation.plan.chunks.find(chunk => Date.parse(chunk.plannedEnd) > Date.parse(checkpoint.segment.lastReceivedAt));
+        operation.currentChunkIndex = current?.index;
+        await saveOperation(repository, operation);
+      }
+      appendStudySummary(`Контрольная точка ${checkpoint.segment.index}: приватный архив подтверждён, поток продолжается.`);
+    },
+  }, process.cwd());
+  const block: ContinuousBlockDraft = { ...draft, checkpoints };
+  atomicJson(path.join(directory, 'continuous-block.json'), block);
+  const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;
+  // Preserve raw input even if acquisition or later scientific processing failed.
+  const archive = await archiveChunk(directory, `continuous-block-${manifest.runId}.tar.gz`);
+  const asset = await uploadConfirmedAsset(repository, archive);
+  return { directory, block, manifest, source: continuousAsset(asset, archive), checkpointDirectories };
+}
+
+/** Scientific windows refer to one immutable run; they do not duplicate events or reset replay. */
+async function publishContinuousWindows(repository: string, directory: string, source: ContinuousAssetIdentity,
+  draft: ContinuousBlockDraft, workspace: string, operation?: BlockOperation): Promise<number> {
+  if (draft.diagnosticOnly || !draft.plan || !draft.phase) return 0;
+  if (draft.acquisitionPolicyHash !== CONTINUOUS_CAPTURE_POLICY_HASH || draft.replayConfigHash !== replayConfigHash()
+    || !sameHashes(draft.simulatorHashes, replaySourceHashes(process.cwd()))) throw new Error('Continuous processing requires its recorded implementation');
+  const plan = draft.plan, identity = readManifestIdentity(directory);
+  const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;
+  if (manifest.instruments.length !== STUDY_TICKERS.length || STUDY_TICKERS.some(ticker => !manifest.instruments.some(item => item.ticker === ticker))) {
+    throw new Error('Continuous study instrument set differs from protocol');
+  }
+  const assessments = await assessContinuousWindows(directory, plan.chunks);
+  let ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value, saved = 0;
+  for (const assessment of assessments) {
+    const assetName = `study-${plan.sessionDate}-${plan.block}-${String(assessment.index).padStart(2, '0')}-${draft.attemptId.replace(':', '-')}.tar.gz`;
+    if (ledger.chunks.some(item => item.assetName === assetName)) continue;
+    const view = path.join(workspace, `window-${identity.runId}-${assessment.index}`);
+    mkdirSync(view, { recursive: true });
+    const reference: ContinuousReference = { schemaVersion: 1, kind: 'CONTINUOUS_WINDOW',
+      acquisitionPolicyHash: draft.acquisitionPolicyHash, source, ...identity };
+    const receiptDraft: ChunkDraft = { schemaVersion: 1, protocolHash: STUDY_PROTOCOL_HASH, assetName,
+      releaseTag: STUDY_RELEASE_TAG, attemptId: draft.attemptId,
+      chunkId: `${plan.sessionDate}:${plan.block}:${assessment.index}`, sessionDate: plan.sessionDate,
+      phase: draft.phase, block: plan.block, chunkIndex: assessment.index,
+      plannedStart: assessment.plannedStart, plannedEnd: assessment.plannedEnd, ...identity,
+      replayConfigHash: draft.replayConfigHash, simulatorHashes: draft.simulatorHashes,
+      quality: assessment.quality, uploadedAt: manifest.completedAt!, acquisitionPolicyHash: draft.acquisitionPolicyHash,
+      ...(plan.recovery ? { collection: studyCollectionMetadata(plan) } : {}) };
+    atomicJson(path.join(view, 'continuous-reference.json'), reference);
+    atomicJson(path.join(view, 'window-quality.json'), assessment);
+    atomicJson(path.join(view, 'study-chunk-receipt.json'), receiptDraft);
+    const archive = await archiveChunk(view, assetName);
+    const asset = await uploadConfirmedAsset(repository, archive);
+    const receipt: StudyChunkReceipt = { ...receiptDraft, ...continuousAsset(asset, archive) };
+    ledger = await updateRemoteLedger(repository, current => acceptStudyChunk(current, receipt), `Accept continuous window ${receipt.chunkId}`);
+    if (operation) {
+      operation.parts.push({ index: assessment.index, status: 'SAVED', assetId: asset.id, quality: assessment.quality,
+        reasons: Object.entries(assessment.checks).filter(([, ok]) => !ok).map(([check]) => check) });
+      await saveOperation(repository, operation);
+    }
+    saved += 1;
+  }
+  return saved;
+}
+
+/** Recovery of a finished raw upload before all scientific references were committed. */
+async function reconcileContinuousBlocks(repository: string, workspace: string): Promise<number> {
+  let failures = 0;
+  let ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+  for (const asset of (await releaseAssets(repository)).filter(item => item.name.startsWith('continuous-block-'))) {
+    try {
+    // Every source has a private completion marker only after all window receipts are committed.
+    const markerPath = `continuous-completed/${asset.id}.json`;
+    if ((await readRemoteText(repository, markerPath)).value) continue;
+    const archive = path.join(workspace, asset.name);
+    await downloadAsset(repository, asset.id, archive);
+    const source = continuousAsset(asset, archive);
+    if (source.assetDigest !== `sha256:${source.archiveSha256}` || statSync(archive).size !== asset.size) throw new Error('Continuous recovery digest mismatch');
+    const directory = await extractContinuousAsset(repository, source, workspace);
+    const draft = JSON.parse(readFileSync(path.join(directory, 'continuous-block.json'), 'utf8')) as ContinuousBlockDraft;
+    const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;
+    if (draft.schemaVersion !== 1 || draft.kind !== 'CONTINUOUS_BLOCK') throw new Error('Invalid continuous block provenance');
+    if (!draft.diagnosticOnly && manifest.status === 'COMPLETE') {
+      if (!ledger.attempts.some(item => item.attemptId === draft.attemptId)) throw new Error('Continuous block has no persisted attempt');
+      await publishContinuousWindows(repository, directory, source, draft, workspace);
+      ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+    }
+    await putRemoteFile(repository, markerPath, `${JSON.stringify({ assetId: asset.id, archiveSha256: source.archiveSha256,
+      diagnosticOnly: draft.diagnosticOnly, status: manifest.status })}\n`, null, 'Confirm continuous block recovery');
+    } catch {
+      failures += 1;
+      appendStudySummary(`Архив ${asset.id}: обработка не восстановлена; источник сохранён и не засчитан. Остальные сводки продолжаются.`);
+    }
+  }
+  return failures;
+}
+
+export async function captureContinuousStudyBlock(repository: string, block: StudyBlock, workspace: string,
+  runId: string, runAttempt: number, signal: AbortSignal): Promise<BlockResult> {
+  if (process.env.MARKET_STUDY_ENABLED !== 'true') throw new Error('Market study capture is paused');
+  const discovered = await discoverBlockPlan(block, signal);
+  if (!discovered) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
+  mkdirSync(workspace, { recursive: true });
+  await ensureDraftRelease(repository);
+  const recovered = await reconcileReleaseAssets(repository);
+  const plan = planRecoverableStudyBlock(discovered.sessionDate, discovered.mainStart, discovered.mainEnd, block, Date.now());
+  if (!plan) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
+  const decision = planStudyRun(recovered, { event: 'schedule', campaignEnabled: true, runId, runAttempt, sessionDate: plan.sessionDate });
+  if (decision.action !== 'CAPTURE') return { action: 'SKIPPED', reason: decision.action, chunks: 0, reportPath: null };
+  if (studyBlockRecorded(recovered, plan)) return { action: 'SKIPPED', reason: 'BLOCK_ALREADY_RECORDED', chunks: 0,
+    reportPath: await maybeFinalizeStudyDay(repository, plan, workspace) };
+  assertFrozenRuntime(recovered);
+  const remaining = remainingStudyChunks(plan, recovered, Date.now());
+  if (!remaining.length) return { action: 'SKIPPED', reason: 'NO_REMAINING_WINDOWS', chunks: 0, reportPath: null };
+  const attemptId = `${runId}:${runAttempt}`;
+  const ledger = await updateRemoteLedger(repository, current => beginStudyAttempt(current, { runId, runAttempt,
+    sessionDate: plan.sessionDate, block: plan.block, mode: 'COUNTED', startedAt: new Date().toISOString() }), 'Begin continuous capture');
+  const phase = ledger.attempts.find(item => item.attemptId === attemptId)?.phase;
+  if (!phase) throw new Error('Continuous attempt phase missing');
+  const operation: BlockOperation = { schemaVersion: 1, attemptId, plan, startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(), state: 'STARTING', failure: null, parts: [], captureFormat: 'continuous-v2',
+    checkpointIntervalMs: continuousCapturePolicy.intervalMs, checkpoints: [] };
+  await saveOperation(repository, operation);
+  try {
+    // This authenticated private write precedes acquisition; market quality is evaluated in-band.
+    const probe = mkdtempSync(path.join(workspace, 'continuous-start-'));
+    atomicJson(path.join(probe, 'startup.json'), { attemptId, acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH, diagnosticOnly: true });
+    await uploadConfirmedAsset(repository, await archiveChunk(probe, `continuous-start-${runId}-${runAttempt}.tar.gz`), signal);
+    await waitUntil(Math.max(Date.parse(plan.captureNotBefore), Date.parse(remaining[0].plannedStart)), signal);
+    const stopAt = Date.parse(plan.ownedEnd) - STUDY_CHUNK_END_MARGIN_MS;
+    if (stopAt <= Date.now()) throw new Error('Continuous block expired during preparation');
+    operation.state = 'CAPTURING'; operation.captureStartedAt = new Date().toISOString(); operation.currentChunkIndex = remaining[0].index; await saveOperation(repository, operation);
+    const result = await recordContinuousStudy(repository, workspace, { ...recorderArguments(workspace,
+      Math.ceil((stopAt - Date.now()) / 1000), 'main'), captureDeadlineMs: stopAt, parentSignal: signal, setExitCodeOnFailure: false },
+    { schemaVersion: 1, kind: 'CONTINUOUS_BLOCK', acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH,
+      attemptId, diagnosticOnly: false, plan, phase, replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()) }, operation);
+    operation.recordingStoppedAt = new Date().toISOString(); await saveOperation(repository, operation);
+    if (result.manifest.status !== 'COMPLETE' || result.manifest.capture?.reason !== 'duration') throw new Error('Continuous capture incomplete; durable raw evidence preserved');
+    const chunks = await publishContinuousWindows(repository, result.directory, result.source, result.block, workspace, operation);
+    const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
+    operation.state = 'FINISHED'; await saveOperation(repository, operation);
+    return { action: 'CAPTURED', plan, chunks, reportPath };
+  } catch (error) {
+    operation.state = signal.aborted ? 'CANCELLED' : 'FAILED';
+    operation.failure = operation.recordingStoppedAt ? 'STORAGE_OR_PROCESSING' : 'RECORDING';
+    try { await saveOperation(repository, operation); } catch { /* Private release assets remain authoritative. */ }
+    appendStudySummary('Непрерывный сбор прерван. Подтверждённые контрольные точки сохранены; неполный день не засчитывается.');
+    throw error;
+  }
+}
+
+async function continuousPilot(repository: string, workspace: string, signal: AbortSignal) {
+  mkdirSync(workspace, { recursive: true });
+  await ensureDraftRelease(repository);
+  const result = await recordContinuousStudy(repository, workspace, { ...recorderArguments(workspace, 180, 'any'),
+    checkpointIntervalMs: 30_000, captureDeadlineMs: Date.now() + 180_000, parentSignal: signal, setExitCodeOnFailure: false }, {
+    schemaVersion: 1, kind: 'CONTINUOUS_BLOCK', acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH,
+    attemptId: `${process.env.GITHUB_RUN_ID ?? '0'}:${process.env.GITHUB_RUN_ATTEMPT ?? '1'}`,
+    diagnosticOnly: true, plan: null, phase: null, replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()),
+  });
+  if (result.manifest.status !== 'COMPLETE' || result.manifest.capture?.reason !== 'duration' || result.block.checkpoints.length < 2) {
+    throw new Error('Continuous pilot capture failed; confirmed checkpoints retained');
+  }
+  const verification = mkdtempSync(path.join(workspace, 'remote-verification-'));
+  const remoteRaw = await extractContinuousAsset(repository, result.source, verification);
+  const remoteManifest = JSON.parse(readFileSync(path.join(remoteRaw, 'manifest.json'), 'utf8')) as ObservationManifest;
+  const remoteSegments: string[] = [];
+  for (const source of result.block.checkpoints) remoteSegments.push(await extractContinuousAsset(repository, source, verification));
+  const restored = await restoreContinuousCheckpoints(remoteSegments, path.join(verification, 'restored'), remoteManifest);
+  if (!restored.complete || restored.recording.sha256 !== remoteManifest.recording?.sha256) throw new Error('Remote checkpoint reconstruction differs from raw run');
+  const summary = JSON.parse(readFileSync(path.join(remoteRaw, 'summary.json'), 'utf8')) as JsonObject;
+  if (summary.allSubscriptionsAcknowledged !== true) throw new Error('Pilot subscription health failed');
+  const replay = await replayRecording(restored.directory, path.join(verification, 'replay'));
+  const evidence = { schemaVersion: 1, action: 'CONTINUOUS_PILOT_VERIFIED', counted: false,
+    acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH, source: result.source,
+    checkpoints: result.block.checkpoints, reconstructionHash: restored.recording.sha256,
+    events: restored.recording.events, connections: remoteManifest.capture?.epochs,
+    capture: remoteManifest.capture, allSubscriptionsAcknowledged: true,
+    replayQuality: replay.quality, verifiedAt: new Date().toISOString() };
+  atomicJson(path.join(verification, 'pilot-verification.json'), evidence);
+  const evidenceDirectory = mkdtempSync(path.join(workspace, 'pilot-evidence-'));
+  atomicJson(path.join(evidenceDirectory, 'pilot-verification.json'), evidence);
+  await uploadConfirmedAsset(repository, await archiveChunk(evidenceDirectory, `continuous-pilot-proof-${remoteManifest.runId}.tar.gz`));
+  appendStudySummary(`Непрерывный прогон проверен: ${result.block.checkpoints.length} архивов скачаны из приватного GitHub и восстановлены без изменения событий. Повторный анализ завершён. Качество данных: **${replay.quality.status}**. Это технический тест, не полный торговый день.`);
+  return evidence;
+}
+
 async function main(argv = process.argv.slice(2)): Promise<void> {
   const { command, values } = parseArguments(argv);
   const controller = new AbortController(), stop = () => controller.abort();
@@ -954,6 +1243,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const directory = await checkedSmoke(path.resolve(required(values, '--workspace')), values.get('--repo'), controller.signal);
       output('action', 'SMOKE_COMPLETE'); output('report_path', directory); console.log(directory); return;
     }
+    if (command === 'continuous-pilot') {
+      const result = await continuousPilot(required(values, '--repo'), path.resolve(required(values, '--workspace')), controller.signal);
+      output('action', result.action); console.log(JSON.stringify(result)); return;
+    }
     if (command === 'observe') {
       const result = await observeMorning(path.resolve(required(values, '--workspace')), required(values, '--repo'), controller.signal);
       output('action', result.action); console.log(JSON.stringify(result)); return;
@@ -974,7 +1267,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     if (command === 'run-block') {
       const block = required(values, '--block'); if (!['early', 'late'].includes(block)) throw new Error('Invalid study block');
-      const result = await captureStudyBlock(repository, block as StudyBlock, path.resolve(required(values, '--workspace')),
+      const result = await captureContinuousStudyBlock(repository, block as StudyBlock, path.resolve(required(values, '--workspace')),
         required(values, '--run-id'), Number(required(values, '--run-attempt')), controller.signal);
       output('action', result.action); if (result.reportPath) output('report_path', result.reportPath);
       if (process.env.GITHUB_STEP_SUMMARY) {
@@ -985,7 +1278,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected prepare-block, preflight, smoke, observe, run-block, freeze, report, or status command');
+    throw new Error('Expected prepare-block, preflight, smoke, observe, continuous-pilot, run-block, freeze, report, or status command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }

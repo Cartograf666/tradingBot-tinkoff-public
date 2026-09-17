@@ -8,6 +8,7 @@ import type { ObservationManifest } from '../research/market-observation.js';
 
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const sourceFiles = ['src/report/replay-orderbook.ts', 'src/research/session-replay.ts',
+  'src/research/continuous-windows.ts', 'src/research/continuous-checkpoints.ts',
   'src/research/order-book-simulator.ts', 'src/research/market-observation.ts',
   'src/research/market-recording.ts', 'src/research/order-book-costs.ts', 'package-lock.json'];
 function projectRoot() {

@@ -36,6 +36,8 @@ export interface RecordingWriterOptions {
   maxBytes?: number;
   segmentMaxBytes?: number;
   fsyncEveryMs?: number;
+  checkpointIntervalMs?: number;
+  onSegmentClosed?: (segment: ClosedRecordingSegment) => void;
 }
 
 export interface RecordingSegmentSummary {
@@ -43,6 +45,13 @@ export interface RecordingSegmentSummary {
   events: number;
   bytes: number;
   sha256: string;
+}
+
+export interface ClosedRecordingSegment extends RecordingSegmentSummary {
+  index: number;
+  firstSequence: number; lastSequence: number;
+  firstReceivedAt: string; lastReceivedAt: string;
+  firstMonotonicOffsetNs: string; lastMonotonicOffsetNs: string;
 }
 
 export interface RecordingSummary {
@@ -86,6 +95,10 @@ export class RecordingWriter {
   private readonly maxBytes: number;
   private readonly segmentMaxBytes: number | null;
   private readonly fsyncEveryMs: number;
+  private readonly checkpointIntervalNs: bigint | null;
+  private readonly onSegmentClosed?: (segment: ClosedRecordingSegment) => void;
+  private segmentFirstEvent: RecordedEvent | null = null;
+  private segmentLastEvent: RecordedEvent | null = null;
   private readonly startedAtNs = process.hrtime.bigint();
   private globalHash: Hash | null = createHash('sha256');
   private segmentHash: Hash | null = null;
@@ -111,6 +124,9 @@ export class RecordingWriter {
       ? null
       : positiveInteger(options.segmentMaxBytes, 'segmentMaxBytes');
     this.fsyncEveryMs = positiveInteger(options.fsyncEveryMs ?? DEFAULT_FSYNC_EVERY_MS, 'fsyncEveryMs', true);
+    this.checkpointIntervalNs = options.checkpointIntervalMs === undefined ? null
+      : BigInt(positiveInteger(options.checkpointIntervalMs, 'checkpointIntervalMs')) * 1_000_000n;
+    this.onSegmentClosed = options.onSegmentClosed;
     mkdirSync(path.dirname(this.recordingPath), { recursive: true });
     this.openSegment();
   }
@@ -120,6 +136,8 @@ export class RecordingWriter {
     this.segmentHash = createHash('sha256');
     this.segmentByteCount = 0;
     this.segmentEventCount = 0;
+    this.segmentFirstEvent = null;
+    this.segmentLastEvent = null;
     this.lastFsyncAt = Date.now();
   }
 
@@ -129,13 +147,22 @@ export class RecordingWriter {
     try { fsyncSync(this.descriptor); } catch (error) { finishError = error; }
     try { closeSync(this.descriptor); } catch (error) { finishError ??= error; }
     this.descriptor = null;
-    this.segmentSummaries.push({
+    const summary: RecordingSegmentSummary = {
       file: path.basename(segmentPath(this.recordingPath, this.segmentIndex)),
       events: this.segmentEventCount,
       bytes: this.segmentByteCount,
       sha256: this.segmentHash.digest('hex'),
-    });
+    };
+    this.segmentSummaries.push(summary);
     this.segmentHash = null;
+    if (!finishError && this.segmentFirstEvent && this.segmentLastEvent) {
+      const first = this.segmentFirstEvent, last = this.segmentLastEvent;
+      try { this.onSegmentClosed?.(Object.freeze({ ...summary, index: this.segmentIndex,
+        firstSequence: first.sequence, lastSequence: last.sequence,
+        firstReceivedAt: first.receivedAt, lastReceivedAt: last.receivedAt,
+        firstMonotonicOffsetNs: first.monotonicOffsetNs, lastMonotonicOffsetNs: last.monotonicOffsetNs })); }
+      catch (error) { finishError = error; }
+    }
     return finishError;
   }
 
@@ -183,8 +210,11 @@ export class RecordingWriter {
     }
 
     try {
-      if (this.segmentMaxBytes !== null && this.segmentByteCount > 0
-        && this.segmentByteCount + buffer.length > this.segmentMaxBytes) this.rotate();
+      const timeBoundary = this.checkpointIntervalNs !== null && this.segmentFirstEvent !== null
+        && BigInt(event.monotonicOffsetNs) - BigInt(this.segmentFirstEvent.monotonicOffsetNs) >= this.checkpointIntervalNs;
+      const sizeBoundary = this.segmentMaxBytes !== null && this.segmentByteCount > 0
+        && this.segmentByteCount + buffer.length > this.segmentMaxBytes;
+      if (timeBoundary || sizeBoundary) this.rotate();
       if (this.descriptor === null || this.segmentHash === null || this.globalHash === null) {
         throw new Error('Recording segment is not open');
       }
@@ -201,6 +231,8 @@ export class RecordingWriter {
       }
       this.sequence += 1;
       this.segmentEventCount += 1;
+      this.segmentFirstEvent ??= event;
+      this.segmentLastEvent = event;
       this.stopped = kind === 'stop';
       const now = Date.now();
       if (this.fsyncEveryMs === 0 || now - this.lastFsyncAt >= this.fsyncEveryMs) {
@@ -224,7 +256,7 @@ export class RecordingWriter {
       events: this.sequence,
       bytes: this.byteCount,
       sha256,
-      ...(this.segmentMaxBytes === null ? {} : { segments: [...this.segmentSummaries] }),
+      ...(this.segmentMaxBytes === null && this.checkpointIntervalNs === null ? {} : { segments: [...this.segmentSummaries] }),
     };
     if (finishError) throw finishError;
     return this.summary;

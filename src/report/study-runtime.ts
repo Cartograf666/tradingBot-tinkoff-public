@@ -1,4 +1,4 @@
-export type StudyRuntimeMode = 'campaign' | 'arm' | 'observe' | 'smoke' | 'preflight';
+export type StudyRuntimeMode = 'campaign' | 'arm' | 'observe' | 'continuous-pilot' | 'smoke' | 'preflight';
 export type StudyRuntimeBlock = 'early' | 'late' | null;
 
 export interface StudyRuntimeSnapshot {
@@ -29,7 +29,7 @@ const MAX_ACTIVE_RUNS = 10;
 const waitingStatuses = new Set(['queued', 'waiting', 'pending', 'requested']);
 const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-const titlePattern = /^Market study \/ (arm|campaign|observe|smoke|preflight) \/ (early|late)$/;
+const titlePattern = /^Market study \/ (arm|campaign|observe|continuous-pilot|smoke|preflight) \/ (early|late)$/;
 const captureStepNames = new Set([
   'Verify private destination and capture the owned block',
   'Verify sandbox access or run market smoke with private archive',

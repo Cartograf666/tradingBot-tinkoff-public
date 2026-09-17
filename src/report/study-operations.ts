@@ -12,6 +12,11 @@ export interface BlockOperation {
   state: 'STARTING' | 'CAPTURING' | 'FINISHED' | 'FAILED' | 'CANCELLED';
   failure: 'STARTUP' | 'RECORDING' | 'STORAGE_OR_PROCESSING' | null;
   currentChunkIndex?: number;
+  captureFormat?: 'continuous-v2';
+  checkpointIntervalMs?: number;
+  checkpoints?: Array<{ index: number; assetId: number; lastReceivedAt: string; confirmedAt: string }>;
+  recordingStoppedAt?: string;
+  captureStartedAt?: string;
   parts: Array<{ index: number; status: 'SAVED' | 'RECORDING_FAILED'; assetId: number;
     quality: 'PASS' | 'INSUFFICIENT_DATA' | null; reasons: string[] }>;
 }
@@ -28,6 +33,13 @@ export function collectorStatus(operations: BlockOperation[], date: string, now:
   if (capture) {
     const operation = current.find(op => op.attemptId.split(':')[0] === capture.runId);
     if (operation?.state === 'CAPTURING') {
+      if (operation.captureFormat === 'continuous-v2') {
+        if (operation.recordingStoppedAt) return { ...base, status: 'PROCESSING' };
+        const last = operation.checkpoints?.at(-1)?.lastReceivedAt ?? operation.captureStartedAt ?? operation.startedAt;
+        base.nextExpectedUploadAt = new Date(Date.parse(last) + (operation.checkpointIntervalMs ?? 300_000) + 180_000).toISOString();
+        base.uploadOverdueSeconds = Math.max(0, Math.floor((now - Date.parse(base.nextExpectedUploadAt)) / 1000));
+        return { ...base, status: base.uploadOverdueSeconds ? 'UPLOAD_OVERDUE' : 'CAPTURING' };
+      }
       const expected = operation.plan.chunks.find(chunk => operation.currentChunkIndex !== undefined
         ? chunk.index === operation.currentChunkIndex && !operation.parts.some(part => part.index === chunk.index && part.status === 'SAVED')
         : Date.parse(chunk.plannedEnd) > Date.parse(operation.startedAt)
@@ -71,25 +83,27 @@ export function operationalDay(ledger: StudyLedger, operations: BlockOperation[]
   const usable = new Set(chunks.filter(item => item.quality === 'PASS'
     && ledger.canonicalChunks[item.chunkId] === item.assetId).map(item => item.chunkId));
   const rejected = new Set(chunks.filter(item => item.quality !== 'PASS').map(item => item.chunkId));
-  const lastUpload = chunks.map(item => item.uploadedAt).sort().at(-1) ?? null;
+  const checkpoints = blocks.flatMap(item => item.checkpoints ?? []);
+  const lastUpload = [...chunks.map(item => item.uploadedAt), ...checkpoints.map(item => item.confirmedAt)].sort().at(-1) ?? null;
   const end = blocks[0]?.plan.mainEnd;
   const closed = end ? now >= Date.parse(end) : date < new Date(now + 3 * 3_600_000).toISOString().slice(0, 10);
   const state = accepted?.quality.status === 'PASS' ? 'DAY_ACCEPTED'
     : accepted || closed ? 'INCOMPLETE_DAY'
     : blocks.some(item => item.state === 'FAILED' || item.state === 'CANCELLED') ? 'INTERRUPTED'
-    : chunks.length ? 'PARTIAL_DATA' : 'NO_DATA';
+    : chunks.length || checkpoints.length ? 'PARTIAL_DATA' : 'NO_DATA';
   const missing = unarchivedWindows(ledger, blocks[0]?.plan, date, now);
   return { schemaVersion: 1 as const, sessionDate: date, state, generatedAt: new Date(now).toISOString(),
     collector: collectorStatus(blocks, date, now, runtime),
     unarchivedClosedWindows: missing.count, unarchivedClosedWindowSeconds: missing.seconds,
     fullDayAccepted: accepted?.quality.status === 'PASS', attempts: attempts.length,
-    confirmedArchives: chunks.length, passingParts: usable.size, rejectedParts: rejected.size,
+    confirmedArchives: chunks.length, confirmedCheckpoints: checkpoints.length, passingParts: usable.size, rejectedParts: rejected.size,
     failedRecordings: blocks.reduce((count, item) => count + item.parts.filter(part => part.status === 'RECORDING_FAILED').length, 0),
     lastConfirmedUpload: lastUpload, mainStart: blocks[0]?.plan.mainStart ?? accepted?.mainStart ?? null,
     mainEnd: end ?? accepted?.mainEnd ?? null,
     dailyQuality: accepted?.quality ?? null,
     blocks: blocks.map(item => ({ block: item.plan.block, state: item.state, failure: item.failure,
-      recovery: item.plan.recovery ?? null,
+      recovery: item.plan.recovery ?? null, captureFormat: item.captureFormat ?? 'legacy',
+      confirmedCheckpoints: item.checkpoints?.length ?? 0, lastDurableEventAt: item.checkpoints?.at(-1)?.lastReceivedAt ?? null,
       plannedParts: item.plan.chunks.length, savedParts: item.parts.filter(part => part.status === 'SAVED').length,
       updatedAt: item.updatedAt })),
     meaning: 'Archive and quality status only. A running workflow or a saved part does not establish full-day completeness or profitability.' };
@@ -104,8 +118,9 @@ export function renderOperationalDay(day: ReturnType<typeof operationalDay>): st
     DIAGNOSTIC: 'Выполняется диагностическая запись', WAITING: 'Подготовка / ожидание очереди', STOPPED: 'Сбор остановлен', IDLE: 'Активного сбора нет' };
   return `### ${day.sessionDate}: ${labels[day.state]}\n\n`
     + `Сборщик: **${runtimeLabels[day.collector.status]}**. Проверка активности: ${day.collector.checkedAt ?? 'не выполнена'}.\n\n`
-    + (day.collector.nextExpectedUploadAt ? `Следующий архив ожидается не позднее ${day.collector.nextExpectedUploadAt} (граница части + 3 минуты на сохранение).\n\n` : '')
+    + (day.collector.nextExpectedUploadAt ? `Следующий архив ожидается не позднее ${day.collector.nextExpectedUploadAt} (с учётом времени на подтверждение сохранения).\n\n` : '')
     + `Подтверждено архивов: **${day.confirmedArchives}**. Частей с пройденным качеством: **${day.passingParts}**; отклонённых: **${day.rejectedParts}**.\n\n`
+    + `Контрольных точек непрерывной записи: **${day.confirmedCheckpoints}**. Научные окна оцениваются после завершения блока; отсутствие их отчёта ещё не означает потерю сохранённого сырья.\n\n`
     + `Неудачных записей с отдельной диагностикой: ${day.failedRecordings}. Последняя подтверждённая загрузка: ${day.lastConfirmedUpload ?? 'нет'}.\n\n`
     + (day.unarchivedClosedWindows === null ? 'Нет подтверждённого календаря для подсчёта пропущенных интервалов.\n\n'
       : `Завершившихся интервалов без подтверждённого архива: **${day.unarchivedClosedWindows}** (${Math.round(day.unarchivedClosedWindowSeconds! / 60)} минут). Это интервалы без архива, а не оценка свежести данных внутри сохранённых частей.\n\n`)

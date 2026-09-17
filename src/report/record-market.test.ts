@@ -4,7 +4,7 @@ import { performance } from 'node:perf_hooks';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { captureMarketStream } from '../research/market-recorder.js';
 import { TinkoffApiError } from 'tinkoff-invest-api';
-import { boundedCaptureDuration, captureCompletionReason, recorderFailure } from './record-market.js';
+import { boundedCaptureDuration, captureCompletionReason, normalizeCaptureStop, recorderFailure } from './record-market.js';
 import { captureDeadlineSignal, MetadataRequestFailure } from './metadata-retry.js';
 
 test('failed chunk continuation is permitted only for classified transient metadata exhaustion', () => {
@@ -43,17 +43,26 @@ test('the real capture loop obeys the earlier setup-bound deadline and discards 
   const durationMs = boundedCaptureDuration(100, now, 100);
   now = 80; // Writer setup occurs after the relative duration was calculated.
   const events: string[] = [];
+  let rawStop: { reason: string } | undefined;
   const result = await captureMarketStream({
     openStream: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => {
       now = 100; expire?.(); return { done: false, value: { late: true } };
     } }) }),
-    record: kind => { events.push(kind); }, expectedSubscriptions: [], acknowledgments: () => [],
+    record: (kind, payload) => {
+      events.push(kind);
+      if (kind === 'stop') rawStop = normalizeCaptureStop(payload, user.signal.aborted, now, 100);
+    }, expectedSubscriptions: [], acknowledgments: () => [],
     durationMs, tickIntervalMs: 10, signal: bound.signal, maxReconnects: 0,
   });
   assert.equal(result.reason, 'aborted');
   assert.equal(captureCompletionReason(result.reason, user.signal.aborted, now, 100), 'duration');
   assert.equal(result.responses, 0); assert.equal(events.includes('response'), false);
-  assert.equal(events.at(-1), 'stop'); bound.dispose();
+  assert.equal(events.at(-1), 'stop');
+  assert.equal(rawStop?.reason, 'duration');
+  const finalCapture = { ...result, reason: rawStop!.reason };
+  user.abort(); // A later cleanup/interrupt cannot alter the reason already persisted.
+  assert.equal(finalCapture.reason, rawStop?.reason);
+  bound.dispose();
 });
 
 
@@ -74,4 +83,74 @@ test('the final main-session chunk uses its remaining capture duration after met
   assert.equal(nextMainSessionWindow(instruments, intervals.map(interval => ({ ...interval, type: 'regular_trading_session' })),
     preparedAt, remainingMs), null);
   assert.throws(() => boundedCaptureDuration(requestedMs, captureDeadlineMs, captureDeadlineMs));
+});
+
+test('checkpoint failures are classified as storage failures and never metadata retries', async () => {
+  const { CheckpointQueueError } = await import('../research/checkpoint-queue.js');
+  for (const category of ['CHECKPOINT_OVERFLOW', 'CHECKPOINT_UPLOAD_FAILED', 'CHECKPOINT_TIMEOUT'] as const) {
+    assert.deepEqual(recorderFailure(new CheckpointQueueError(category), 'stream'),
+      { code: null, stage: 'checkpoint', category, retryable: false });
+  }
+});
+
+test('the capture loop keeps one connection across temporal checkpoints', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const { RecordingWriter, scanRecording } = await import('../research/market-recording.js');
+  const recordingPath = path.join(mkdtempSync(path.join(tmpdir(), 'continuous-capture-')), 'events.ndjson');
+  let opened = 0, checkpoints = 0;
+  const writer = new RecordingWriter({ path: recordingPath, runId: 'one-connection', checkpointIntervalMs: 15,
+    onSegmentClosed: () => { checkpoints += 1; } });
+  const result = await captureMarketStream({
+    openStream: () => { opened += 1; return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => undefined) }) }; },
+    record: (kind, payload, epoch) => writer.append(kind, payload, epoch),
+    expectedSubscriptions: [], acknowledgments: () => [], durationMs: 90, tickIntervalMs: 5,
+    heartbeatTimeoutMs: 1000,
+  });
+  const summary = writer.close();
+  assert.equal(opened, 1); assert.equal(result.epochs, 1); assert.equal(result.disconnects, 0);
+  assert.ok(checkpoints >= 2);
+  const kinds: string[] = [];
+  const scanned = await scanRecording(recordingPath, event => { kinds.push(event.kind); }, summary.segments);
+  assert.equal(scanned.hasStop, true); assert.equal(kinds.filter(kind => kind === 'connect_attempt').length, 1);
+  assert.equal(kinds.filter(kind => kind === 'stop').length, 1);
+  assert.equal(kinds.includes('gap'), false);
+});
+
+test('upload failure aborts the actual capture and cannot produce a successful duration stop', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const { RecordingWriter, scanRecording } = await import('../research/market-recording.js');
+  const { CheckpointQueue } = await import('../research/checkpoint-queue.js');
+  const controller = new AbortController();
+  const queue = new CheckpointQueue<unknown>({ upload: async () => { throw new Error('storage unavailable'); },
+    onFailure: error => controller.abort(error) });
+  const recordingPath = path.join(mkdtempSync(path.join(tmpdir(), 'failed-continuous-')), 'events.ndjson');
+  const writer = new RecordingWriter({ path: recordingPath, runId: 'storage-failure', checkpointIntervalMs: 5,
+    onSegmentClosed: segment => queue.enqueue(segment) });
+  await assert.rejects(captureMarketStream({
+    openStream: () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => undefined) }) }),
+    record: (kind, payload, epoch) => { queue.throwIfFailed(); writer.append(kind, payload, epoch); },
+    expectedSubscriptions: [], acknowledgments: () => [], durationMs: 500, tickIntervalMs: 5,
+    signal: controller.signal,
+  }), /CHECKPOINT_UPLOAD_FAILED/);
+  try { writer.close(); } catch { /* Final file remains durable even if it cannot be queued. */ }
+  await assert.rejects(queue.drain(), /CHECKPOINT_UPLOAD_FAILED/);
+  assert.equal(controller.signal.aborted, true);
+  assert.equal((await scanRecording(recordingPath, undefined, writer.close().segments)).hasStop, false);
+});
+
+
+test('terminal raw stop normalization preserves user/storage aborts even at an expired deadline', () => {
+  const payload = { reason: 'aborted', diagnostic: 'original' };
+  assert.deepEqual(normalizeCaptureStop(payload, false, 100, 100), { reason: 'duration', diagnostic: 'original' });
+  assert.deepEqual(payload, { reason: 'aborted', diagnostic: 'original' });
+  for (const cause of ['user', 'storage']) {
+    const controller = new AbortController(); controller.abort(cause);
+    assert.equal(normalizeCaptureStop(payload, controller.signal.aborted, 101, 100).reason, 'aborted');
+  }
+  assert.equal(normalizeCaptureStop({ reason: 'max_reconnects' }, false, 101, 100).reason, 'max_reconnects');
+  assert.throws(() => normalizeCaptureStop({ private: 'invalid' }, false, 101, 100), /Invalid capture stop/);
 });

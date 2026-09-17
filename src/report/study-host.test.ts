@@ -37,6 +37,7 @@ test('public GITHUB_TOKEN and legacy broker token cannot replace the two dedicat
   assert.throws(() => resolveStudyHost({ ...configured(), TINKOFF_API_TOKEN_SANDBOX: '', TINKOFF_API_TOKEN: 'legacy-token' }, 'smoke'), /TINKOFF_API_TOKEN_SANDBOX/);
   assert.throws(() => resolveStudyHost({ ...configured(), TINKOFF_API_TOKEN_SANDBOX: '', TINKOFF_API_TOKEN: 'legacy-token' }, 'preflight'), /TINKOFF_API_TOKEN_SANDBOX/);
   assert.throws(() => resolveStudyHost({ ...configured(), TINKOFF_API_TOKEN_SANDBOX: '', TINKOFF_API_TOKEN: 'legacy-token' }, 'observe'), /TINKOFF_API_TOKEN_SANDBOX/);
+  assert.throws(() => resolveStudyHost({ ...configured(), TINKOFF_API_TOKEN_SANDBOX: '', TINKOFF_API_TOKEN: 'legacy-token' }, 'continuous-pilot'), /TINKOFF_API_TOKEN_SANDBOX/);
   assert.equal(resolveStudyHost({ ...configured(), TINKOFF_API_TOKEN_SANDBOX: '' }, 'status'), 'owner/study-data');
   assert.throws(() => resolveStudyHost({ ...configured(), MARKET_STUDY_ENABLED: 'false' }, 'campaign'), /paused/);
 });
