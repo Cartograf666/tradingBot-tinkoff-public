@@ -1200,14 +1200,18 @@ async function continuousPilot(repository: string, workspace: string, signal: Ab
   const remoteManifest = JSON.parse(readFileSync(path.join(remoteRaw, 'manifest.json'), 'utf8')) as ObservationManifest;
   const remoteSegments: string[] = [];
   for (const source of result.block.checkpoints) remoteSegments.push(await extractContinuousAsset(repository, source, verification));
-  const restored = await restoreContinuousCheckpoints(remoteSegments, path.join(verification, 'restored'), remoteManifest);
-  if (!restored.complete || restored.recording.sha256 !== remoteManifest.recording?.sha256) throw new Error('Remote checkpoint reconstruction differs from raw run');
+  const restored = await restoreContinuousCheckpoints(remoteSegments, path.join(verification, 'restored'), path.join(remoteRaw, 'manifest.json'));
+  if (!restored.complete || restored.recording.sha256 !== remoteManifest.recording?.sha256
+    || readManifestIdentity(restored.directory).manifestHash !== readManifestIdentity(remoteRaw).manifestHash) {
+    throw new Error('Remote checkpoint reconstruction differs from raw run');
+  }
   const summary = JSON.parse(readFileSync(path.join(remoteRaw, 'summary.json'), 'utf8')) as JsonObject;
   if (summary.allSubscriptionsAcknowledged !== true) throw new Error('Pilot subscription health failed');
   const replay = await replayRecording(restored.directory, path.join(verification, 'replay'));
   const evidence = { schemaVersion: 1, action: 'CONTINUOUS_PILOT_VERIFIED', counted: false,
     acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH, source: result.source,
     checkpoints: result.block.checkpoints, reconstructionHash: restored.recording.sha256,
+    manifestHash: readManifestIdentity(restored.directory).manifestHash,
     events: restored.recording.events, connections: remoteManifest.capture?.epochs,
     capture: remoteManifest.capture, allSubscriptionsAcknowledged: true,
     replayQuality: replay.quality, verifiedAt: new Date().toISOString() };
