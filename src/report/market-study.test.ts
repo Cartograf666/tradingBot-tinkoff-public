@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, publishDailyResearchReport, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
+import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, publishDailyResearchReport, recordedResearchPlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
@@ -11,6 +11,16 @@ import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '..
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('legacy daily research restores full API bounds, never the partial recording bounds or another date', () => {
+  const instruments = [{ exchange: 'MOEX' }];
+  const intervals = [{ exchange: 'MOEX', type: 'regular_trading_session_main',
+    start: '2026-09-15T06:00:00.000Z', end: '2026-09-15T15:54:59.000Z' }];
+  const plan = recordedResearchPlan('2026-09-15', instruments, intervals);
+  assert.equal(plan.mainStart, intervals[0].start); assert.equal(plan.mainEnd, intervals[0].end);
+  assert.throws(() => recordedResearchPlan('2026-09-14', instruments, intervals), /session date/);
+  assert.throws(() => recordedResearchPlan('2026-09-15', [{ exchange: 'OTHER' }], intervals), /session date/);
+});
 
 test('private research publication repairs an interrupted write and publishes its pointer last', async () => {
   // Storage orchestration fixture: replay math and scenario completeness have separate tests.

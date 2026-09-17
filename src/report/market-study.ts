@@ -777,6 +777,18 @@ export async function publishDailyResearchReport(
   if (previous.value !== content) await store.write(pointer, content, previous.sha, `Index research ${summary.sessionDate}`);
 }
 
+/** Legacy archives predate operations files; their saved API calendar remains authoritative. */
+export function recordedResearchPlan(sessionDate: string,
+  instruments: Parameters<typeof nextMainSessionWindow>[0], intervals: Parameters<typeof nextMainSessionWindow>[1]): StudyBlockPlan {
+  const window = nextMainSessionWindow(instruments, intervals, dayStartUtc(sessionDate), 1);
+  if (!window || new Date(Date.parse(window.start) + 3 * 3_600_000).toISOString().slice(0, 10) !== sessionDate) {
+    throw new Error('Archive does not confirm its research session date');
+  }
+  const plan = planStudyBlock(sessionDate, window.start, window.end, 'early', Date.parse(`${sessionDate}T05:50:00.000Z`));
+  if (!plan) throw new Error('Archived research calendar cannot form the original full-day plan');
+  return plan;
+}
+
 export async function refreshDailyResearchReports(repository: string): Promise<number> {
   await ensureStateBranch(repository);
   const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
@@ -793,6 +805,19 @@ export async function refreshDailyResearchReports(repository: string): Promise<n
       throw new Error('Conflicting research session calendars');
     }
     plans.set(plan.sessionDate, plan);
+  }
+  for (const date of new Set(ledger.attempts.filter(attempt => attempt.phase === 'DEVELOPMENT')
+    .map(attempt => attempt.sessionDate).filter((date): date is string => Boolean(date)))) {
+    if (plans.has(date)) continue;
+    const first = ledger.chunks.filter(chunk => chunk.sessionDate === date && chunk.phase === 'DEVELOPMENT')
+      .sort((a, b) => a.uploadedAt.localeCompare(b.uploadedAt) || a.assetId - b.assetId)[0];
+    if (!first) continue;
+    const temporary = mkdtempSync(path.join(tmpdir(), 'research-calendar-'));
+    try {
+      const directory = await materializeAsset(repository, first, temporary);
+      const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;
+      plans.set(date, recordedResearchPlan(date, manifest.instruments, manifest.intervals));
+    } finally { rmSync(temporary, { recursive: true, force: true }); }
   }
   const identity = { replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(),
     fixedScenarios: fixedReplayScenarios(), reportVersionHash: hashStudyValue({
