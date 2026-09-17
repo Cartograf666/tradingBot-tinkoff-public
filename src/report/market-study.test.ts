@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
+import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, publishDailyResearchReport, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
@@ -11,6 +11,42 @@ import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '..
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('private research publication repairs an interrupted write and publishes its pointer last', async () => {
+  // Storage orchestration fixture: replay math and scenario completeness have separate tests.
+  const summary = { schemaVersion: 1, kind: 'daily-diagnostic-research', identity: 'a'.repeat(64),
+    diagnosticOnly: true, counted: false, formalHoldout: false, sessionDate: '2026-09-17', fullDayAccepted: false,
+    session: { date: '2026-09-17', phase: 'DEVELOPMENT', mainStart: '2026-09-17T06:00:00Z', mainEnd: '2026-09-17T15:55:00Z' },
+    inputs: [], replay: { quality: { status: 'INSUFFICIENT_DATA', recordedShare: .1,
+      expectedTicks: 10, observedTicks: 1, perInstrument: [] }, results: [],
+      dataset: { scope: 'session', sessionDate: '2026-09-17', mainStart: '2026-09-17T06:00:00Z',
+        mainEnd: '2026-09-17T15:55:00Z', datasetHash: 'd'.repeat(64), inputs: [], mappings: [] },
+      fixedScenarios: [], configHash: 'b'.repeat(64), simulatorHashes: {}, runtimeHashes: {}, limitations: [] }, reportVersionHash: 'c'.repeat(64),
+  } as Parameters<typeof publishDailyResearchReport>[0];
+  const files = new Map<string, string>(), writes: string[] = [];
+  let interruptMarkdown = true;
+  const store = {
+    read: async (file: string) => ({ value: files.get(file) ?? '', sha: files.has(file) ? 'sha' : null }),
+    write: async (file: string, content: string) => {
+      if (file.endsWith('.md') && interruptMarkdown) throw new Error('Storage interrupted');
+      files.set(file, content); writes.push(file);
+    },
+  };
+  const pointer = 'reports/research-2026-09-17.json';
+  await assert.rejects(publishDailyResearchReport(summary, store), /Storage interrupted/);
+  assert.equal(files.size, 1); assert.equal(files.has(pointer), false);
+  interruptMarkdown = false;
+  await publishDailyResearchReport(summary, store);
+  assert.equal(files.size, 3); assert.equal(writes.at(-1), pointer);
+  const before = writes.length;
+  await publishDailyResearchReport(summary, store);
+  assert.equal(writes.length, before, 'identical retry performs no writes');
+  assert.equal([...files.keys()].some(file => /study-ledger|operations/.test(file)), false);
+  const jsonFile = `reports/research-2026-09-17-${summary.identity}.json`;
+  files.set(jsonFile, 'conflicting content');
+  await assert.rejects(publishDailyResearchReport(summary, store), /Immutable research content mismatch/);
+  assert.equal(writes.length, before, 'conflicting immutable input is never overwritten');
+});
 
 test('smoke summary explains the observed 47/60 failure without changing its 80% requirement', () => {
   const summary = { groups: ['SBER', 'GAZP', 'MAGN', 'VKCO', 'SMLT', 'AFKS'].map(ticker => ({ ticker, source: 'EXCHANGE',

@@ -7,7 +7,7 @@
   },
   "include": [
     "src/report/record-market.ts", "src/report/replay-orderbook.ts", "src/report/market-study.ts", "src/report/market-study.test.ts",
-    "src/report/study-host.ts", "src/report/study-host.test.ts",
+    "src/report/study-host.ts", "src/report/study-host.test.ts", "src/report/daily-research.test.ts",
     "src/report/smoke-retry.ts", "src/report/smoke-retry.test.ts",
     "src/report/continuous-*.test.ts", "src/report/immutable-asset.test.ts", "src/research/continuous-*.test.ts", "src/research/checkpoint-queue.test.ts",
     "src/report/metadata-retry.test.ts", "src/report/record-market.test.ts",

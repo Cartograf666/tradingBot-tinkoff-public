@@ -13,7 +13,8 @@ import { confirmImmutableAsset } from './immutable-asset.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
 import { closedPlansNeedingFinalization, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
 import { readStudyRuntime } from './study-runtime.js';
-import { replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
+import { fixedReplayScenarios, replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
+import { buildDailyResearchReport, dailyResearchIdentity, renderDailyResearchReport, selectDailyResearchInputs } from './daily-research.js';
 import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
@@ -742,10 +743,114 @@ export async function refreshOperationalReports(repository: string): Promise<num
   }
   const readme = await readRemoteText(repository, README_PATH);
   await putRemoteFile(repository, README_PATH, ledgerReadme(ledger, repository)
-    + `\nOperational daily reports: [reports](https://github.com/${repository}/tree/${STUDY_STATE_BRANCH}/reports). Incomplete days are reported separately and never accepted as scientific evidence.\n`, readme.sha, 'Refresh study completeness status');
+    + `\nOperational daily reports and separate DEVELOPMENT research summaries: [reports](https://github.com/${repository}/tree/${STUDY_STATE_BRANCH}/reports). Research results are linked by research-YYYY-MM-DD.json; incomplete days are never accepted as scientific evidence.\n`, readme.sha, 'Refresh study completeness status');
   if (replayFailures) throw new Error('Scientific report recovery failed; operational evidence was saved');
   if (!runtime.available) throw new Error('Collector activity could not be verified; operational evidence was saved with UNKNOWN status');
   return dates.length;
+}
+
+/** Derived diagnostics use existing fixed replay only. They never write the study ledger. */
+export async function publishDailyResearchReport(
+  summary: ReturnType<typeof buildDailyResearchReport>['json'],
+  store: {
+    read(file: string): Promise<RemoteFile<string>>;
+    write(file: string, content: string, sha: string | null, message: string): Promise<void>;
+  },
+): Promise<void> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(summary.sessionDate) || !/^[0-9a-f]{64}$/.test(summary.identity)
+    || summary.diagnosticOnly !== true || summary.counted !== false || summary.formalHoldout !== false) {
+    throw new Error('Invalid private diagnostic report');
+  }
+  const base = `reports/research-${summary.sessionDate}-${summary.identity}`;
+  const files = [[`${base}.json`, `${JSON.stringify(summary, null, 2)}\n`],
+    [`${base}.md`, renderDailyResearchReport(summary)]];
+  for (const [file, content] of files) {
+    const previous = await store.read(file);
+    if (previous.value && previous.value !== content) throw new Error('Immutable research content mismatch');
+    if (!previous.value) await store.write(file, content, null, `Save research ${summary.sessionDate}`);
+  }
+  // Publish the mutable pointer last: a partial write cannot advertise a missing report.
+  const pointer = `reports/research-${summary.sessionDate}.json`;
+  const previous = await store.read(pointer);
+  const content = `${JSON.stringify({ schemaVersion: 1, sessionDate: summary.sessionDate, state: 'READY',
+    identity: summary.identity, diagnosticOnly: true, counted: false, json: `${base}.json`, markdown: `${base}.md` }, null, 2)}\n`;
+  if (previous.value !== content) await store.write(pointer, content, previous.sha, `Index research ${summary.sessionDate}`);
+}
+
+export async function refreshDailyResearchReports(repository: string): Promise<number> {
+  await ensureStateBranch(repository);
+  const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+  const plans = new Map<string, StudyBlockPlan>();
+  for (const attempt of ledger.attempts) {
+    if (attempt.phase !== 'DEVELOPMENT' || !/^\d+:\d+$/.test(attempt.attemptId)) continue;
+    const remote = await readRemoteText(repository, `operations/${attempt.attemptId.replace(':', '-')}.json`);
+    if (!remote.value) continue;
+    const operation = JSON.parse(remote.value) as BlockOperation;
+    const plan = operation.plan;
+    if (plan.sessionDate !== attempt.sessionDate) throw new Error('Research operation date mismatch');
+    const previous = plans.get(plan.sessionDate);
+    if (previous && (previous.mainStart !== plan.mainStart || previous.mainEnd !== plan.mainEnd)) {
+      throw new Error('Conflicting research session calendars');
+    }
+    plans.set(plan.sessionDate, plan);
+  }
+  const identity = { replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(),
+    fixedScenarios: fixedReplayScenarios(), reportVersionHash: hashStudyValue({
+      report: sha256File(path.resolve('src/report/daily-research.ts')),
+      integration: sha256File(path.resolve('src/report/market-study.ts')),
+    }) };
+  let completed = 0, failures = 0;
+  for (const plan of [...plans.values()].sort((a, b) => b.sessionDate.localeCompare(a.sessionDate))) {
+    const selection = selectDailyResearchInputs(ledger, plan);
+    if (selection.action !== 'closed') continue;
+    const key = dailyResearchIdentity(selection, identity);
+    const base = `reports/research-${plan.sessionDate}-${key}`;
+    const pointer = `reports/research-${plan.sessionDate}.json`;
+    const previousIndex = await readRemoteText(repository, pointer);
+    if (previousIndex.value) {
+      const index = JSON.parse(previousIndex.value) as { identity?: string; state?: string; reason?: string };
+      if (index.identity === key && index.state === 'BLOCKED' && index.reason === 'INCOMPATIBLE_RECORDINGS') {
+        appendStudySummary(`Диагностический анализ ${plan.sessionDate} ожидает совместимых данных; причина сохранена приватно.`);
+        continue;
+      }
+    }
+    const cached = await readRemoteText(repository, `${base}.json`);
+    let summary: ReturnType<typeof buildDailyResearchReport>['json'];
+    if (cached.value) {
+      summary = JSON.parse(cached.value) as typeof summary;
+      if (summary.identity !== key || summary.sessionDate !== plan.sessionDate || summary.diagnosticOnly !== true) {
+        throw new Error('Cached research identity mismatch');
+      }
+    } else {
+      const workspace = mkdtempSync(path.join(tmpdir(), `market-study-research-${plan.sessionDate}-`));
+      try {
+        const directories = await materializeStudyInputs(repository, selection.receipts, workspace);
+        const replay = await replaySession(directories, path.join(workspace, 'replay'), {
+          sessionDate: plan.sessionDate, mainStart: plan.mainStart, mainEnd: plan.mainEnd,
+        });
+        summary = buildDailyResearchReport(selection, replay, identity).json;
+      } catch (error) {
+        const reason = error instanceof Error && error.message === 'Incompatible chunk metadata or recorder version'
+          ? 'INCOMPATIBLE_RECORDINGS' : 'RESEARCH_PROCESSING_FAILED';
+        const previous = await readRemoteText(repository, pointer);
+        await putRemoteFile(repository, pointer, `${JSON.stringify({ schemaVersion: 1, sessionDate: plan.sessionDate,
+          state: 'BLOCKED', reason, identity: key, diagnosticOnly: true, counted: false,
+          updatedAt: new Date().toISOString() }, null, 2)}\n`, previous.sha, `Report blocked research ${plan.sessionDate}`);
+        appendStudySummary(`Диагностический анализ ${plan.sessionDate}: ${reason}. Подробности доступны только в приватном хранилище.`);
+        // Mixed historical recorder versions are an explicit data boundary, not a runtime failure.
+        if (reason !== 'INCOMPATIBLE_RECORDINGS') failures += 1;
+        continue;
+      } finally { rmSync(workspace, { recursive: true, force: true }); }
+    }
+    await publishDailyResearchReport(summary, {
+      read: file => readRemoteText(repository, file),
+      write: (file, content, sha, message) => putRemoteFile(repository, file, content, sha, message),
+    });
+    appendStudySummary(`Закреплённый диагностический анализ ${plan.sessionDate} сохранён приватно. Полнота дня и научный зачёт учитываются отдельно.`);
+    completed += 1;
+  }
+  if (failures) throw new Error('Daily research failed; private diagnostic status saved');
+  return completed;
 }
 
 export async function captureStudyBlock(repository: string, block: StudyBlock, workspace: string,
@@ -1260,6 +1365,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const dates = await refreshOperationalReports(repository);
       console.log(JSON.stringify({ action: 'OPERATIONAL_REPORTS_UPDATED', dates })); return;
     }
+    if (command === 'research') {
+      const dates = await refreshDailyResearchReports(repository);
+      console.log(JSON.stringify({ action: 'DAILY_RESEARCH_UPDATED', dates })); return;
+    }
     if (command === 'status') {
       const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
       console.log(JSON.stringify({ phase: ledger.phase, attempts: ledger.attempts.length, chunks: ledger.chunks.length, days: ledger.days.length })); return;
@@ -1282,7 +1391,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected prepare-block, preflight, smoke, observe, continuous-pilot, run-block, freeze, report, or status command');
+    throw new Error('Expected prepare-block, preflight, smoke, observe, continuous-pilot, run-block, freeze, report, research, or status command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }

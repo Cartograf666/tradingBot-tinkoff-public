@@ -37,11 +37,19 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npx tsc -p tsconfig.study.json
-      - name: Recover uploaded receipts and report all incomplete days
+      - name: Verify private report destination
+        id: destination
         env:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+        run: node .study-dist/src/report/study-host.js report
+      - name: Recover uploaded receipts and report all incomplete days
+        env:
+          GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           STUDY_ACTIONS_TOKEN: ${{ github.token }}
-        run: |
-          node .study-dist/src/report/study-host.js report
-          node .study-dist/src/report/market-study.js report --repo "$MARKET_STUDY_DATA_REPOSITORY"
+        run: node .study-dist/src/report/market-study.js report --repo "$MARKET_STUDY_DATA_REPOSITORY"
+      - name: Analyze closed DEVELOPMENT sessions with fixed scenarios
+        if: ${{ !cancelled() && steps.destination.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+        run: node .study-dist/src/report/market-study.js research --repo "$MARKET_STUDY_DATA_REPOSITORY"
