@@ -63,6 +63,8 @@ export interface StudyBlockPlan {
   captureNotBefore: string;
   latenessMs: number;
   chunks: StudyChunkPlan[];
+  /** Collection recovery only; full-session scientific bounds remain unchanged. */
+  recovery?: { requestedBlock: StudyBlock; selectedAt: string; partialStart: boolean };
 }
 
 function utcForMoscowDate(date: string, hour: number, minute: number): number {
@@ -93,6 +95,37 @@ export function planStudyBlock(
   block: StudyBlock,
   nowMs: number,
 ): StudyBlockPlan | null {
+  return buildStudyBlockPlan(sessionDate, mainStart, mainEnd, block, nowMs, false);
+}
+
+/** A late trigger collects the remaining real session without redefining its denominator. */
+export function planRecoverableStudyBlock(
+  sessionDate: string,
+  mainStart: string,
+  mainEnd: string,
+  requestedBlock: StudyBlock,
+  nowMs: number,
+): StudyBlockPlan | null {
+  if (!['early', 'late'].includes(requestedBlock) || !Number.isFinite(nowMs)) throw new Error('Invalid recovery request');
+  if (new Date(nowMs + 3 * 3_600_000).toISOString().slice(0, 10) !== sessionDate) return null;
+  const split = utcForMoscowDate(sessionDate, 14, 0);
+  const block = requestedBlock === 'early' && nowMs >= split ? 'late' : requestedBlock;
+  const plan = buildStudyBlockPlan(sessionDate, mainStart, mainEnd, block, nowMs, true);
+  if (!plan) return null;
+  if (block !== requestedBlock || plan.latenessMs > STUDY_LAUNCH_LATENESS_MS) {
+    plan.recovery = { requestedBlock, selectedAt: new Date(nowMs).toISOString(), partialStart: nowMs > Date.parse(plan.ownedStart) };
+  }
+  return plan;
+}
+
+function buildStudyBlockPlan(
+  sessionDate: string,
+  mainStart: string,
+  mainEnd: string,
+  block: StudyBlock,
+  nowMs: number,
+  recoverLate: boolean,
+): StudyBlockPlan | null {
   const start = Date.parse(mainStart), end = Date.parse(mainEnd);
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !Number.isFinite(nowMs)) {
     throw new Error('Invalid study block clock');
@@ -101,12 +134,15 @@ export function planStudyBlock(
   const prepare = utcForMoscowDate(sessionDate, block === 'early' ? 8 : 13, 50);
   const ownedStart = block === 'early' ? start : Math.max(start, split);
   const ownedEnd = block === 'early' ? Math.min(end, split) : end;
-  if (ownedEnd <= ownedStart || nowMs < prepare || nowMs > ownedStart + STUDY_LAUNCH_LATENESS_MS) return null;
+  if (!['early', 'late'].includes(block)) throw new Error('Invalid study block');
+  if (ownedEnd <= ownedStart || (!recoverLate && nowMs < prepare) || nowMs >= ownedEnd
+    || (!recoverLate && nowMs > ownedStart + STUDY_LAUNCH_LATENESS_MS)
+    || (recoverLate && ownedEnd - Math.max(nowMs, ownedStart) < 120_000)) return null;
   const chunks: StudyChunkPlan[] = [];
   for (let cursor = ownedStart, index = 1; cursor < ownedEnd; cursor += STUDY_CHUNK_MAX_MS, index += 1) {
     chunks.push({ index, plannedStart: new Date(cursor).toISOString(), plannedEnd: new Date(Math.min(cursor + STUDY_CHUNK_MAX_MS, ownedEnd)).toISOString() });
   }
-  if (ownedEnd - Math.max(nowMs, prepare) > STUDY_JOB_MAX_MS) return null;
+  if (ownedEnd - (recoverLate ? nowMs : Math.max(nowMs, prepare)) > STUDY_JOB_MAX_MS) return null;
   return {
     sessionDate, block, mainStart: new Date(start).toISOString(), mainEnd: new Date(end).toISOString(),
     ownedStart: new Date(ownedStart).toISOString(), ownedEnd: new Date(ownedEnd).toISOString(),

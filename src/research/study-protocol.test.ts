@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation, studyProtocol,
+  STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, studyProtocol,
 } from './study-protocol.js';
 
 test('protocol hash covers the paused full-session collection contract', () => {
@@ -70,4 +70,60 @@ test('late job admission is bounded and missing time remains observable', () => 
   assert.equal(chunkDurationSeconds(within.chunks[0], Date.parse('2026-09-14T06:20:00Z')), 595);
   assert.equal(planStudyBlock('2026-09-14', start, end, 'early', Date.parse('2026-09-14T06:20:00.001Z')), null);
   assert.equal(planStudyBlock('2026-09-14', start, end, 'early', Date.parse('2026-09-14T05:49:59Z')), null);
+});
+
+
+test('recovery retains the full morning denominator and original windows at 13:02 Moscow', () => {
+  const day = '2026-09-17', start = `${day}T06:00:00Z`, end = `${day}T15:54:59Z`;
+  const original = planStudyBlock(day, start, end, 'early', Date.parse(`${day}T05:50:00Z`))!;
+  const now = Date.parse(`${day}T10:02:00Z`);
+  const recovered = planRecoverableStudyBlock(day, start, end, 'early', now)!;
+  assert.equal(recovered.block, 'early');
+  assert.equal(recovered.mainStart, original.mainStart); assert.equal(recovered.mainEnd, original.mainEnd);
+  assert.equal(recovered.ownedStart, original.ownedStart); assert.equal(recovered.ownedEnd, original.ownedEnd);
+  assert.deepEqual(recovered.chunks, original.chunks);
+  assert.equal(recovered.latenessMs, 242 * 60_000);
+  assert.deepEqual(recovered.recovery, { requestedBlock: 'early', selectedAt: new Date(now).toISOString(), partialStart: true });
+  assert.equal(planStudyBlock(day, start, end, 'early', now), null);
+});
+
+test('late early triggers choose the afternoon block, retaining its full scientific bounds', () => {
+  const day = '2026-09-17', start = `${day}T06:00:00Z`, end = `${day}T15:54:59Z`;
+  const original = planStudyBlock(day, start, end, 'late', Date.parse(`${day}T10:50:00Z`))!;
+  for (const time of ['11:13', '12:00']) {
+    const recovered = planRecoverableStudyBlock(day, start, end, 'early', Date.parse(`${day}T${time}:00Z`))!;
+    assert.equal(recovered.block, 'late');
+    assert.equal(recovered.ownedStart, original.ownedStart); assert.equal(recovered.ownedEnd, original.ownedEnd);
+    assert.equal(recovered.mainStart, original.mainStart); assert.equal(recovered.mainEnd, original.mainEnd);
+    assert.deepEqual(recovered.chunks, original.chunks);
+    assert.equal(recovered.recovery?.requestedBlock, 'early'); assert.equal(recovered.recovery?.partialStart, true);
+  }
+});
+
+test('afternoon requests before its start wait for afternoon without recording morning', () => {
+  const day = '2026-09-17';
+  const plan = planRecoverableStudyBlock(day, `${day}T06:00:00Z`, `${day}T15:54:59Z`, 'late', Date.parse(`${day}T10:10:00Z`))!;
+  assert.equal(plan.block, 'late'); assert.equal(plan.captureNotBefore, `${day}T11:00:00.000Z`);
+  assert.equal(plan.chunks[0].plannedStart, `${day}T11:00:00.000Z`);
+  assert.equal(plan.recovery, undefined);
+});
+
+test('on-time recoverable planning equals the strict original contract', () => {
+  const day = '2026-09-17', start = `${day}T06:00:00Z`, end = `${day}T15:54:59Z`;
+  for (const block of ['early', 'late'] as const) {
+    const now = Date.parse(`${day}T${block === 'early' ? '05:50' : '10:50'}:00Z`);
+    assert.deepEqual(planRecoverableStudyBlock(day, start, end, block, now), planStudyBlock(day, start, end, block, now));
+  }
+});
+
+test('recovery is date-bound, requires meaningful remaining time and never extends closed sessions', () => {
+  const day = '2026-09-17', start = `${day}T06:00:00Z`, end = `${day}T15:54:59Z`;
+  const close = Date.parse(end);
+  assert.ok(planRecoverableStudyBlock(day, start, end, 'early', close - 120_000));
+  for (const now of [close - 119_999, close, close + 1, Date.parse('2026-09-18T12:00:00Z'), Date.parse(`${day}T00:00:00Z`)]) {
+    assert.equal(planRecoverableStudyBlock(day, start, end, 'early', now), null);
+  }
+  // On a holiday discovery supplies no session; a previous day's API window cannot be reused.
+  assert.equal(planRecoverableStudyBlock('2026-09-18', start, end, 'early', Date.parse('2026-09-18T12:00:00Z')), null);
+  assert.throws(() => planRecoverableStudyBlock(day, end, start, 'early', Date.parse(`${day}T12:00:00Z`)), /clock/);
 });

@@ -3,11 +3,13 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '25 16 * * 1-5'
+    - cron: '37 6-16 * * 1-5'
   workflow_run:
     workflows: ['Market study (public compute, private data)']
     types: [completed]
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: market-study-report
   cancel-in-progress: false
@@ -39,6 +41,7 @@ jobs:
         env:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
+          STUDY_ACTIONS_TOKEN: ${{ github.token }}
         run: |
           node .study-dist/src/report/study-host.js report
           node .study-dist/src/report/market-study.js report --repo "$MARKET_STUDY_DATA_REPOSITORY"

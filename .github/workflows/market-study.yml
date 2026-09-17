@@ -1,8 +1,14 @@
 name: Market study (public compute, private data)
-run-name: Market study / ${{ github.event_name == 'schedule' && 'arm' || inputs.mode }} / ${{ github.event_name == 'schedule' && (github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
+run-name: Market study / ${{ github.event_name == 'schedule' && 'arm' || inputs.mode }} / ${{ github.event_name == 'schedule' && (github.event.schedule == '17,47 0 * * 1-5' || github.event.schedule == '17 1 * * 1-5' || github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
 
 on:
   schedule:
+    # UTC: 03:17/03:47/04:17 and 08:17/08:47/09:17 Moscow.
+    # Each preparation remains within the existing 350-minute job limit.
+    - cron: '17,47 0 * * 1-5'
+    - cron: '17 1 * * 1-5'
+    - cron: '17,47 5 * * 1-5'
+    - cron: '17 6 * * 1-5'
     # Start runners early; credential-free preparation waits for 08:50/13:50 MSK.
     - cron: '20,35 5 * * 1-5'
     - cron: '20,35 10 * * 1-5'
@@ -27,9 +33,10 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: market-study-${{ github.event_name == 'schedule' && (github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || (inputs.mode == 'campaign' || inputs.mode == 'arm') && inputs.block || inputs.mode }}
+  group: market-study-${{ github.event_name == 'schedule' && (github.event.schedule == '17,47 0 * * 1-5' || github.event.schedule == '17 1 * * 1-5' || github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || (inputs.mode == 'campaign' || inputs.mode == 'arm') && inputs.block || inputs.mode }}
   cancel-in-progress: false
 
 env:
@@ -75,10 +82,13 @@ jobs:
       - run: npx tsc -p tsconfig.study.json
       - name: Wait for today's block without broker or storage credentials
         env:
-          STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
+          STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '17,47 0 * * 1-5' || github.event.schedule == '17 1 * * 1-5' || github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
         run: node .study-dist/src/report/market-study.js prepare-block --block "$STUDY_BLOCK"
 
   campaign:
+    concurrency:
+      group: market-study-capture
+      cancel-in-progress: false
     needs: prepare
     if: >-
       !cancelled() &&
@@ -107,7 +117,7 @@ jobs:
           TINKOFF_API_TOKEN_SANDBOX: ${{ secrets.TINKOFF_API_TOKEN_SANDBOX }}
           GRPC_DEFAULT_SSL_ROOTS_FILE_PATH: ${{ github.workspace }}/certs/russian-trusted-root-ca.pem
           MARKET_STUDY_ENABLED: ${{ vars.MARKET_STUDY_ENABLED }}
-          STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
+          STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '17,47 0 * * 1-5' || github.event.schedule == '17 1 * * 1-5' || github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
         run: |
           node .study-dist/src/report/study-host.js campaign
           node .study-dist/src/report/market-study.js run-block \
@@ -116,6 +126,9 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
 
   utility:
+    concurrency:
+      group: ${{ (inputs.mode == 'preflight' || inputs.mode == 'smoke' || inputs.mode == 'observe') && 'market-study-capture' || format('market-study-utility-{0}', inputs.mode) }}
+      cancel-in-progress: false
     if: >-
       github.event.repository.private == false &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
@@ -151,6 +164,7 @@ jobs:
           MARKET_STUDY_STORAGE_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           GH_TOKEN: ${{ secrets.MARKET_STUDY_STORAGE_TOKEN }}
           STUDY_MODE: ${{ inputs.mode }}
+          STUDY_ACTIONS_TOKEN: ${{ github.token }}
         run: |
           node .study-dist/src/report/study-host.js "$STUDY_MODE"
           node .study-dist/src/report/market-study.js "$STUDY_MODE" --repo "$MARKET_STUDY_DATA_REPOSITORY"

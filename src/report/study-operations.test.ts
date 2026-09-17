@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { closedPlansNeedingFinalization, operationalDay, recordOwnedSlot, recoverableRecordingFailure, renderOperationalDay, type BlockOperation } from './study-operations.js';
+import { closedPlansNeedingFinalization, collectorStatus, operationalDay, recordOwnedSlot, recoverableRecordingFailure, renderOperationalDay, type BlockOperation } from './study-operations.js';
 import { createStudyLedger } from '../research/study-state.js';
 import { planStudyBlock } from '../research/study-protocol.js';
+import type { StudyRuntimeSnapshot } from './study-runtime.js';
 
 test('the report recovers an unfinished historical day once and waits until its session closes', () => {
   const plan = planStudyBlock('2026-09-15', '2026-09-15T06:00:00Z', '2026-09-15T15:54:59Z', 'late', Date.parse('2026-09-15T10:50:00Z'))!;
@@ -21,6 +22,74 @@ test('missing capture remains an incomplete operational day without accepting sc
   assert.equal(day.state, 'INCOMPLETE_DAY'); assert.equal(day.fullDayAccepted, false);
   assert.equal(day.confirmedArchives, 0); assert.equal(ledger.days.length, 0);
   assert.match(renderOperationalDay(day), /не засчитан/);
+});
+
+const reportDate = '2026-09-17', reportNow = Date.parse(`${reportDate}T12:10:00Z`);
+function operation(state: BlockOperation['state'] = 'CAPTURING'): BlockOperation {
+  const plan = planStudyBlock(reportDate, `${reportDate}T06:00:00Z`, `${reportDate}T15:54:59Z`, 'late', Date.parse(`${reportDate}T10:50:00Z`))!;
+  return { schemaVersion: 1, attemptId: '123:1', plan, state, failure: null, parts: [],
+    startedAt: `${reportDate}T12:05:00Z`, updatedAt: `${reportDate}T12:06:00Z`, currentChunkIndex: 3 };
+}
+function runtime(runs: StudyRuntimeSnapshot['runs'] = []): StudyRuntimeSnapshot {
+  return { checkedAt: new Date(reportNow).toISOString(), available: true, reason: null, runs };
+}
+const activeRun = { runId: '123', mode: 'campaign' as const, block: 'early' as const, status: 'in_progress',
+  captureJobRunning: true, captureCommandRunning: true, preparing: false, queued: false, startedAt: null };
+
+test('stored capture state never substitutes for fresh GitHub liveness evidence', () => {
+  assert.equal(collectorStatus([operation()], reportDate, reportNow).status, 'UNKNOWN');
+  assert.equal(collectorStatus([operation()], reportDate, reportNow, { ...runtime(), available: false, reason: 'API_UNAVAILABLE' }).status, 'UNKNOWN');
+  assert.equal(collectorStatus([operation()], reportDate, reportNow, runtime()).status, 'STOPPED');
+  assert.equal(collectorStatus([], reportDate, reportNow, runtime()).status, 'IDLE');
+  assert.equal(collectorStatus([operation()], '2026-09-16', reportNow, runtime()).status, 'HISTORICAL');
+  const earlierFailure = { ...operation('FAILED'), updatedAt: `${reportDate}T12:00:00Z` };
+  assert.equal(collectorStatus([earlierFailure, operation('FINISHED')], reportDate, reportNow, runtime()).status, 'IDLE');
+});
+
+test('runtime separates waiting, startup and diagnostic commands from canonical capture', () => {
+  const status = (run: StudyRuntimeSnapshot['runs'][number], op: BlockOperation = operation()) => collectorStatus([op], reportDate, reportNow, runtime([run])).status;
+  assert.equal(status({ ...activeRun, captureCommandRunning: false, captureJobRunning: false, preparing: true }), 'WAITING');
+  assert.equal(status({ ...activeRun, captureCommandRunning: false, captureJobRunning: false, queued: true }), 'WAITING');
+  assert.equal(status({ ...activeRun, captureCommandRunning: false }), 'STARTING');
+  assert.equal(status(activeRun, operation('STARTING')), 'STARTING');
+  assert.equal(status({ ...activeRun, mode: 'observe', block: null }), 'DIAGNOSTIC');
+  assert.equal(status(activeRun), 'CAPTURING');
+});
+
+test('archive deadline follows the actually selected chunk, with explicit upload grace and overdue status', () => {
+  const live = runtime([activeRun]);
+  const day = operationalDay(createStudyLedger(), [operation()], reportDate, reportNow, live);
+  assert.equal(day.collector.nextExpectedUploadAt, `${reportDate}T12:33:00.000Z`);
+  const overdue = collectorStatus([operation()], reportDate, Date.parse(`${reportDate}T12:34:00Z`), live);
+  assert.equal(overdue.status, 'UPLOAD_OVERDUE'); assert.equal(overdue.uploadOverdueSeconds, 60);
+  const nextChunk = { ...operation(), currentChunkIndex: 4 };
+  assert.equal(collectorStatus([nextChunk], reportDate, Date.parse(`${reportDate}T12:34:00Z`), live).status, 'CAPTURING');
+  assert.equal(day.fullDayAccepted, false);
+});
+
+test('saved final archive cannot become overdue during scientific replay', () => {
+  const op = { ...operation(), currentChunkIndex: 10 };
+  op.parts.push({ index: 10, status: 'SAVED', assetId: 123, quality: 'PASS', reasons: [] });
+  const status = collectorStatus([op], reportDate, Date.parse(`${reportDate}T16:10:00Z`), runtime([activeRun]));
+  assert.equal(status.status, 'PROCESSING');
+  assert.equal(status.nextExpectedUploadAt, null); assert.equal(status.uploadOverdueSeconds, 0);
+});
+
+test('missing archive windows retain the whole session denominator and do not count future windows', () => {
+  const ledger = createStudyLedger(), op = operation();
+  const withoutArchives = operationalDay(ledger, [op], reportDate, reportNow, runtime());
+  assert.equal(withoutArchives.unarchivedClosedWindows, 12);
+  assert.equal(withoutArchives.unarchivedClosedWindowSeconds, 6 * 3600);
+  const saved = op.plan.chunks[0];
+  ledger.chunks.push({ sessionDate: reportDate, block: 'late', chunkIndex: saved.index,
+    plannedStart: saved.plannedStart, plannedEnd: saved.plannedEnd, uploadedAt: `${reportDate}T11:30:20Z`,
+    quality: 'INSUFFICIENT_DATA', assetId: 456, chunkId: `${reportDate}:late:1` } as typeof ledger.chunks[number]);
+  const withArchive = operationalDay(ledger, [op], reportDate, reportNow, runtime());
+  assert.equal(withArchive.unarchivedClosedWindows, 11);
+  assert.equal(withArchive.rejectedParts, 1); assert.equal(withArchive.fullDayAccepted, false);
+  assert.equal(ledger.days.length, 0);
+  assert.match(renderOperationalDay(withArchive), /не оценка свежести/);
+  assert.equal(operationalDay(ledger, [], reportDate, reportNow).unarchivedClosedWindows, null);
 });
 test('only explicit transient metadata failures permit continuation', () => {
   const failure = { stage: 'metadata', retryable: true, category: 'TIMEOUT' };

@@ -3,10 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyRecorderArguments, waitUntil } from './market-study.js';
+import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
-import { planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
+import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
 
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
@@ -228,6 +228,8 @@ test('every retry schedule and manual capture map to the same block and concurre
   const evaluate = (expression: string, event: string, schedule: string, mode: string, block: string) =>
     Function('github', 'inputs', `return (${expression});`)({ event_name: event, event: { schedule } }, { mode, block });
   for (const [schedule, block] of [
+    ['17,47 0 * * 1-5', 'early'], ['17 1 * * 1-5', 'early'],
+    ['17,47 5 * * 1-5', 'late'], ['17 6 * * 1-5', 'late'],
     ['20,35 5 * * 1-5', 'early'], ['20,35 10 * * 1-5', 'late'],
     ['50,55 5 * * 1-5', 'early'], ['0,5,10,15 6 * * 1-5', 'early'],
     ['50,55 10 * * 1-5', 'late'], ['0,5,10,15 11 * * 1-5', 'late'],
@@ -249,7 +251,7 @@ test('every retry schedule and manual capture map to the same block and concurre
 
 test('prepared capture cannot run after preparation fails or is cancelled, while regular capture tolerates skipped preparation', () => {
   const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
-  const expression = /  campaign:\n    needs: prepare\n    if: >-\n([\s\S]*?)    runs-on:/.exec(workflow)![1].trim();
+  const expression = /  campaign:\n[\s\S]*?    needs: prepare\n    if: >-\n([\s\S]*?)    runs-on:/.exec(workflow)![1].trim();
   const evaluate = (event: string, mode: string, result: string, cancelled: boolean, enabled = 'true', trusted = true) =>
     Function('github', 'inputs', 'needs', 'vars', 'cancelled', 'format', `return (${expression});`)(
       { event_name: event, event: { repository: { private: false, default_branch: 'main' } }, ref: trusted ? 'refs/heads/main' : 'refs/pull/1/merge' },
@@ -277,6 +279,24 @@ test('workflow keeps schedules activation-gated and action versions immutable', 
   assert.doesNotMatch(workflow, /TINKOFF_API_TOKEN_PROD/);
 });
 
+test('all market commands share one capture lock while preparation and reports stay independent', () => {
+  const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
+  const campaign = workflow.split('  campaign:')[1].split('  utility:')[0];
+  const utility = workflow.split('  utility:')[1];
+  assert.match(campaign, /concurrency:\n      group: market-study-capture\n      cancel-in-progress: false/);
+  assert.match(utility, /cancel-in-progress: false/);
+  const expression = /group: \$\{\{ (.*?) \}\}/.exec(utility)![1];
+  const group = (mode: string) => Function('inputs', 'format', `return (${expression});`)(
+    { mode }, (_: string, value: string) => `market-study-utility-${value}`);
+  for (const mode of ['preflight', 'smoke', 'observe']) assert.equal(group(mode), 'market-study-capture');
+  for (const mode of ['report', 'status', 'freeze']) assert.notEqual(group(mode), 'market-study-capture');
+  assert.doesNotMatch(workflow.split('  prepare:')[1].split('  campaign:')[0], /market-study-capture|secrets\./);
+  const reports = readFileSync(path.resolve('.github/workflows/study-report.yml'), 'utf8');
+  assert.match(reports, /actions: read/);
+  assert.match(reports, /STUDY_ACTIONS_TOKEN: \$\{\{ github.token \}\}/);
+  assert.doesNotMatch(reports, /TINKOFF_API_TOKEN|market-study-capture/);
+});
+
 // Reproduces the campaign caller bug: preparation must consume, not extend, the owned slot.
 test('campaign caller supplies an absolute deadline including the existing end margin', () => {
   const chunk = { index: 1, plannedStart: '2026-09-16T11:00:00Z', plannedEnd: '2026-09-16T11:30:00Z' };
@@ -286,4 +306,52 @@ test('campaign caller supplies an absolute deadline including the existing end m
   assert.equal(args.parentSignal, signal); assert.equal(args.setExitCodeOnFailure, false);
   assert.equal(boundedCaptureDuration(args.seconds * 1000, Date.parse('2026-09-16T11:00:20Z'), args.captureDeadlineMs), 1_775_000);
   assert.throws(() => studyRecorderArguments('/tmp/test', chunk, Date.parse('2026-09-16T11:29:56Z'), signal));
+});
+
+
+test('passing quality has no synthetic failure reason', () => {
+  assert.deepEqual(smokeQualityReasons({}, { status: 'PASS', checks: {} }), []);
+});
+
+test('late recovery receives a fresh bounded smoke deadline and leaves time for capture', () => {
+  const day = '2026-09-17', start = `${day}T06:00:00Z`, end = `${day}T15:54:59Z`;
+  const now = Date.parse(`${day}T12:00:00Z`);
+  const recovered = planRecoverableStudyBlock(day, start, end, 'early', now)!;
+  assert.equal(studyStartupDeadline(recovered, now), now + 8 * 60_000);
+  const almostClosed = Date.parse(end) - 120_000;
+  const finalPlan = planRecoverableStudyBlock(day, start, end, 'early', almostClosed)!;
+  assert.equal(studyStartupDeadline(finalPlan, almostClosed), Date.parse(end) - 20_000);
+  const original = planStudyBlock(day, start, end, 'early', Date.parse(`${day}T05:50:00Z`))!;
+  assert.equal(studyStartupDeadline(original, Date.parse(start)), Date.parse(start) + 20 * 60_000);
+  assert.throws(() => studyStartupDeadline(recovered, NaN), /clock/);
+});
+
+test('recovery skips elapsed windows and already confirmed windows without changing their identities', () => {
+  const day = '2026-09-17', now = Date.parse(`${day}T10:02:00Z`);
+  const plan = planRecoverableStudyBlock(day, `${day}T06:00:00Z`, `${day}T15:54:59Z`, 'early', now)!;
+  const ledger = createStudyLedger();
+  assert.deepEqual(remainingStudyChunks(plan, ledger, now).map(chunk => chunk.index), [9, 10]);
+  const confirmed = plan.chunks[8];
+  const receipt = { sessionDate: day, block: 'early', chunkIndex: 9,
+    plannedStart: confirmed.plannedStart, plannedEnd: confirmed.plannedEnd, assetId: 123 } as StudyChunkReceipt;
+  ledger.chunks.push(receipt); ledger.canonicalChunks[`${day}:early:9`] = 123;
+  assert.deepEqual(remainingStudyChunks(plan, ledger, now).map(chunk => chunk.index), [10]);
+  assert.equal(studyChunkRecorded(ledger, plan, confirmed), true);
+  assert.equal(studyBlockRecorded(ledger, plan), false);
+  assert.equal(remainingStudyChunks(plan, ledger, Date.parse(plan.ownedEnd)).length, 0);
+  // A confirmed receipt from another date must not suppress this capture.
+  receipt.sessionDate = '2026-09-16';
+  assert.deepEqual(remainingStudyChunks(plan, ledger, now).map(chunk => chunk.index), [9, 10]);
+});
+
+
+test('immutable recovery provenance carries original session and ownership bounds', () => {
+  const day = '2026-09-17', now = Date.parse(`${day}T12:00:00Z`);
+  const plan = planRecoverableStudyBlock(day, `${day}T06:00:00Z`, `${day}T15:54:59Z`, 'early', now)!;
+  assert.deepEqual(studyCollectionMetadata(plan), { mode: 'RECOVERY', requestedBlock: 'early',
+    selectedAt: new Date(now).toISOString(), partialStart: true,
+    mainStart: `${day}T06:00:00.000Z`, mainEnd: `${day}T15:54:59.000Z`,
+    ownedStart: `${day}T11:00:00.000Z`, ownedEnd: `${day}T15:54:59.000Z` });
+  const original = planStudyBlock(day, plan.mainStart, plan.mainEnd, 'early', Date.parse(`${day}T05:50:00Z`))!;
+  assert.equal(studyCollectionMetadata(original), undefined);
 });

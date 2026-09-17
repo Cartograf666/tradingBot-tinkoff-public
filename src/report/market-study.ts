@@ -8,12 +8,13 @@ import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { TINKOFF_SANDBOX_ENDPOINT } from '../core/tinkoff-client.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
 import { closedPlansNeedingFinalization, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
+import { readStudyRuntime } from './study-runtime.js';
 import { replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
 import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
 import {
-  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planStudyBlock, planStudyPreparation,
+  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
@@ -197,7 +198,7 @@ async function discoverBlockPlan(block: StudyBlock, signal: AbortSignal): Promis
   const moscowDate = new Date(now + 3 * 3_600_000).toISOString().slice(0, 10);
   const window = nextMainSessionWindow(discovery.instruments, discovery.intervals, dayStartUtc(moscowDate), 1);
   if (!window) return null;
-  return planStudyBlock(moscowDate, window.start, window.end, block, now);
+  return planRecoverableStudyBlock(moscowDate, window.start, window.end, block, now);
 }
 
 /** Runs at any hour; proves sandbox authentication AND both private write paths.
@@ -259,6 +260,7 @@ export function assessStudyChunk(directory: string, bounds?: Pick<StudyChunkPlan
 
 /** Only fixed labels, known tickers and validated counts may enter public diagnostics. */
 export function smokeQualityReasons(summary: JsonObject, quality: ChunkQuality): string[] {
+  if (quality.status === 'PASS') return [];
   const count = (value: unknown): number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const reasons: string[] = [];
   const labels: Record<string, string> = {
@@ -401,7 +403,18 @@ async function uploadConfirmedAsset(repository: string, archive: string): Promis
   return asset;
 }
 
-interface ChunkDraft extends Omit<StudyChunkReceipt, 'assetId' | 'assetDigest' | 'assetBytes' | 'archiveSha256'> {}
+interface ChunkDraft extends Omit<StudyChunkReceipt, 'assetId' | 'assetDigest' | 'assetBytes' | 'archiveSha256'> {
+  collection?: RecoveryCollectionMetadata;
+}
+interface RecoveryCollectionMetadata {
+  mode: 'RECOVERY'; requestedBlock: StudyBlock; selectedAt: string; partialStart: boolean;
+  mainStart: string; mainEnd: string; ownedStart: string; ownedEnd: string;
+}
+/** Immutable provenance describes missing time without changing scientific acceptance. */
+export function studyCollectionMetadata(plan: StudyBlockPlan): RecoveryCollectionMetadata | undefined {
+  return plan.recovery ? { mode: 'RECOVERY', ...plan.recovery, mainStart: plan.mainStart,
+    mainEnd: plan.mainEnd, ownedStart: plan.ownedStart, ownedEnd: plan.ownedEnd } : undefined;
+}
 interface DayDraft extends Omit<StudyDayReceipt,
   'reportAssetId' | 'reportAssetName' | 'reportAssetDigest' | 'reportAssetBytes' | 'reportArchiveSha256'> {}
 function readManifestIdentity(directory: string): { runId: string; manifestHash: string; recordingHash: string } {
@@ -629,6 +642,19 @@ export function studyChunkRecorded(ledger: StudyLedger, plan: StudyBlockPlan, ch
   return studyBlockRecorded(ledger, { ...plan, chunks: [chunk] });
 }
 
+/** Skip elapsed and confirmed windows while preserving every original chunk identity. */
+export function remainingStudyChunks(plan: StudyBlockPlan, ledger: StudyLedger, nowMs: number): StudyChunkPlan[] {
+  return plan.chunks.filter(chunk => chunkDurationSeconds(chunk, nowMs) > 0 && !studyChunkRecorded(ledger, plan, chunk));
+}
+
+/** Recovery has a fresh bounded startup budget and leaves time for actual capture. */
+export function studyStartupDeadline(plan: StudyBlockPlan, nowMs: number): number {
+  if (!Number.isFinite(nowMs)) throw new Error('Invalid startup clock');
+  return plan.recovery
+    ? Math.min(nowMs + 8 * 60_000, Date.parse(plan.ownedEnd) - 20_000)
+    : Math.min(Date.parse(plan.ownedStart) + STUDY_LAUNCH_LATENESS_MS, Date.parse(plan.ownedEnd));
+}
+
 type BlockResult = { action: 'CAPTURED'; plan: StudyBlockPlan; chunks: number; reportPath: string | null }
   | { action: 'SKIPPED'; reason: string; chunks: 0; reportPath: string | null };
 export function studyRecorderArguments(workspace: string, chunk: StudyChunkPlan, nowMs: number, signal: AbortSignal): RecorderArguments {
@@ -653,7 +679,7 @@ async function saveOperation(repository: string, operation: BlockOperation): Pro
 /** Runs without broker access, including after a crashed job or on the next morning. */
 export async function refreshOperationalReports(repository: string): Promise<number> {
   let ledger = await reconcileReleaseAssets(repository);
-  const operations: BlockOperation[] = [];
+  let operations: BlockOperation[] = [];
   for (const attempt of ledger.attempts) {
     if (!/^\d+:\d+$/.test(attempt.attemptId)) continue;
     const text = await readRemoteText(repository, `operations/${attempt.attemptId.replace(':', '-')}.json`);
@@ -672,11 +698,19 @@ export async function refreshOperationalReports(repository: string): Promise<num
   } finally { rmSync(recoveryWorkspace, { recursive: true, force: true }); }
   ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
   const today = new Date(Date.now() + 3 * 3_600_000).toISOString().slice(0, 10);
+  // Historical replay can take time; refresh today's operations before checking liveness.
+  operations = operations.filter(operation => operation.plan.sessionDate !== today);
+  for (const attempt of ledger.attempts.filter(attempt => attempt.sessionDate === today)) {
+    if (!/^\d+:\d+$/.test(attempt.attemptId)) continue;
+    const text = await readRemoteText(repository, `operations/${attempt.attemptId.replace(':', '-')}.json`);
+    if (text.value) operations.push(JSON.parse(text.value) as BlockOperation);
+  }
   const previous = new Date(`${today}T00:00:00Z`);
   do { previous.setUTCDate(previous.getUTCDate() - 1); } while ([0, 6].includes(previous.getUTCDay()));
   const dates = [...new Set([...ledger.attempts.map(item => item.sessionDate).filter((date): date is string => Boolean(date)), previous.toISOString().slice(0, 10), today])].sort();
+  const runtime = await readStudyRuntime(process.env);
   for (const date of dates) {
-    const day = operationalDay(ledger, operations, date);
+    const day = operationalDay(ledger, operations, date, Date.now(), runtime);
     const file = `reports/daily-${date}.json`, previous = await readRemoteText(repository, file);
     await putRemoteFile(repository, file, `${JSON.stringify(day, null, 2)}\n`, previous.sha, `Report capture completeness ${date}`);
     appendStudySummary(renderOperationalDay(day));
@@ -685,23 +719,30 @@ export async function refreshOperationalReports(repository: string): Promise<num
   await putRemoteFile(repository, README_PATH, ledgerReadme(ledger, repository)
     + `\nOperational daily reports: [reports](https://github.com/${repository}/tree/${STUDY_STATE_BRANCH}/reports). Incomplete days are reported separately and never accepted as scientific evidence.\n`, readme.sha, 'Refresh study completeness status');
   if (replayFailures) throw new Error('Scientific report recovery failed; operational evidence was saved');
+  if (!runtime.available) throw new Error('Collector activity could not be verified; operational evidence was saved with UNKNOWN status');
   return dates.length;
 }
 
 export async function captureStudyBlock(repository: string, block: StudyBlock, workspace: string,
   runId: string, runAttempt: number, signal: AbortSignal): Promise<BlockResult> {
   if (process.env.MARKET_STUDY_ENABLED !== 'true') throw new Error('Full-session campaign is paused pending storage configuration, sandbox smoke and activation');
-  const plan = await discoverBlockPlan(block, signal);
-  if (!plan) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
+  const discoveredPlan = await discoverBlockPlan(block, signal);
+  if (!discoveredPlan) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
   mkdirSync(path.resolve(workspace), { recursive: true });
   await ensureDraftRelease(repository);
   const recovered = await reconcileReleaseAssets(repository);
+  // Private reconciliation can cross the 14:00 split; select using the fresh clock.
+  const plan = planRecoverableStudyBlock(discoveredPlan.sessionDate, discoveredPlan.mainStart, discoveredPlan.mainEnd, block, Date.now());
+  if (!plan) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
+  block = plan.block;
   const decision = planStudyRun(recovered, { event: 'schedule', campaignEnabled: true, runId, runAttempt,
     sessionDate: plan.sessionDate });
   if (decision.action !== 'CAPTURE') return { action: 'SKIPPED', reason: decision.action, chunks: 0, reportPath: null };
   if (studyBlockRecorded(recovered, plan)) return { action: 'SKIPPED', reason: 'BLOCK_ALREADY_RECORDED', chunks: 0,
     reportPath: await maybeFinalizeStudyDay(repository, plan, workspace) };
   assertFrozenRuntime(recovered);
+  if (!remainingStudyChunks(plan, recovered, Date.now()).length) return { action: 'SKIPPED', reason: 'NO_REMAINING_WINDOWS', chunks: 0, reportPath: null };
+  if (plan.recovery) appendStudySummary(`Восстановление сбора: блок **${block}**; пропущенное время не восстанавливается, полный день ещё не подтверждён.`);
   const attemptId = `${runId}:${runAttempt}`;
   let persisted = await updateRemoteLedger(repository, ledger => beginStudyAttempt(ledger, { runId, runAttempt,
     sessionDate: plan.sessionDate, block, mode: 'COUNTED', startedAt: new Date().toISOString() }), `Begin ${plan.sessionDate} ${block}`);
@@ -713,12 +754,11 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
   try {
     const result = await runAfterBlockCheck(Date.parse(plan.captureNotBefore), signal, async () => {
       appendStudySummary('Стартовая проверка: запись 60 секунд основной сессии.');
-      await checkedSmoke(workspace, repository, signal,
-        Math.min(Date.parse(plan.ownedStart) + STUDY_LAUNCH_LATENESS_MS, Date.parse(plan.ownedEnd)));
+      await checkedSmoke(workspace, repository, signal, studyStartupDeadline(plan, Date.now()));
     }, async () => {
       operation.state = 'CAPTURING'; await saveOperation(repository, operation);
       let uploaded = 0;
-      for (const chunk of plan.chunks) {
+      for (const chunk of remainingStudyChunks(plan, persisted, Date.now())) {
         signal.throwIfAborted();
         await waitUntil(Date.parse(chunk.plannedStart), signal);
         if (chunkDurationSeconds(chunk, Date.now()) <= 0) continue;
@@ -726,6 +766,8 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
         persisted = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
         assertFrozenRuntime(persisted);
         if (studyChunkRecorded(persisted, plan, chunk)) continue;
+        operation.currentChunkIndex = chunk.index;
+        await saveOperation(repository, operation);
         const directory = await recordOwnedSlot({ deadlineMs: Date.parse(chunk.plannedEnd) - STUDY_CHUNK_END_MARGIN_MS, signal,
           wait: (delay, parent) => waitUntil(Date.now() + delay, parent),
           attempt: async () => {
@@ -756,7 +798,8 @@ export async function captureStudyBlock(repository: string, block: StudyBlock, w
           plannedStart: chunk.plannedStart, plannedEnd: chunk.plannedEnd, runId: identity.runId,
           manifestHash: identity.manifestHash, recordingHash: identity.recordingHash,
           replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()), quality: quality.status,
-          uploadedAt: new Date().toISOString() };
+          uploadedAt: new Date().toISOString(),
+          ...(plan.recovery ? { collection: studyCollectionMetadata(plan) } : {}) };
         const attempt = persisted.attempts.find(item => item.attemptId === attemptId);
         if (!attempt?.phase) throw new Error('Persisted study attempt disappeared');
         draft.phase = attempt.phase;

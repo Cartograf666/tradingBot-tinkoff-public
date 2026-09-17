@@ -10,7 +10,7 @@
     "src/report/study-host.ts", "src/report/study-host.test.ts",
     "src/report/smoke-retry.ts", "src/report/smoke-retry.test.ts",
     "src/report/metadata-retry.test.ts", "src/report/record-market.test.ts",
-    "src/report/diagnose-freshness.ts", "src/report/study-operations.test.ts", "src/research/market-recording-report.test.ts",
+    "src/report/study-runtime.test.ts", "src/report/diagnose-freshness.ts", "src/report/study-operations.test.ts", "src/research/market-recording-report.test.ts",
     "src/research/session-replay.test.ts", "src/research/order-book-simulator.test.ts",
     "src/research/study-*.test.ts", "src/research/market-recording.test.ts",
     "src/research/market-recorder.test.ts", "src/research/market-observation.test.ts",
