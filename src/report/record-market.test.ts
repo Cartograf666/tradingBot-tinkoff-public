@@ -21,6 +21,23 @@ test('failed chunk continuation is permitted only for classified transient metad
   assert.doesNotMatch(JSON.stringify(recorderFailure(new Error('private-token'), 'metadata')), /private-token/);
 });
 
+test('a recording that reaches its byte budget keeps the cap and records a typed capacity failure', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const { RecordingWriter } = await import('../research/market-recording.js');
+  const directory = mkdtempSync(path.join(tmpdir(), 'recording-capacity-'));
+  try {
+    const writer = new RecordingWriter({ path: path.join(directory, 'events.ndjson'), runId: 'capacity', maxBytes: 180 });
+    let failure: unknown;
+    try { writer.append('response', { payload: 'x'.repeat(500) }, 1); } catch (error) { failure = error; }
+    assert.deepEqual(recorderFailure(failure, 'stream'), {
+      code: null, stage: 'stream', category: 'CAPACITY_EXHAUSTED', retryable: false,
+    });
+    assert.equal(writer.close().bytes, 0, 'the event that exceeds the hard cap is not partially written');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 
 test('absolute deadline completion is duration but never masks user cancellation or a stream failure', () => {
   assert.equal(captureCompletionReason('aborted', false, 1000, 1000), 'duration');

@@ -570,7 +570,7 @@ export async function materializeAsset(repository: string, receipt: StudyChunkRe
   if (existsSync(referencePath)) {
     const reference = JSON.parse(readFileSync(referencePath, 'utf8')) as ContinuousReference;
     if (reference.schemaVersion !== 1 || reference.kind !== 'CONTINUOUS_WINDOW'
-      || reference.acquisitionPolicyHash !== CONTINUOUS_CAPTURE_POLICY_HASH || reference.runId !== receipt.runId
+      || !supportedContinuousPolicyHash(reference.acquisitionPolicyHash) || reference.runId !== receipt.runId
       || reference.manifestHash !== receipt.manifestHash || reference.recordingHash !== receipt.recordingHash) {
       throw new Error('Continuous window reference identity differs from receipt');
     }
@@ -1099,14 +1099,27 @@ interface ContinuousReference {
   schemaVersion: 1; kind: 'CONTINUOUS_WINDOW'; acquisitionPolicyHash: string;
   source: ContinuousAssetIdentity; runId: string; manifestHash: string; recordingHash: string;
 }
-// Acquisition v2 supersedes v1's separate quality-gated smoke and per-window reconnects.
+// Acquisition v2 superseded v1's separate quality-gated smoke and per-window reconnects.
+// Keep its hash readable so immutable v2 window references remain replayable after capacity changes.
+export const CONTINUOUS_CAPTURE_POLICY_V2_HASH = hashStudyValue({
+  version: 2, intervalMs: 300_000, maxPendingCheckpoints: 2, uploadDeadlineMs: 120_000,
+  rawRunScope: 'owned-block', startup: 'in-band-subscription-health',
+  qualityFailure: 'archive-and-continue', scientificWindows: 'original-30-minute-bounds',
+} as const);
+// Two Sep 22 blocks reached 1 GiB; the faster one did so after about 4.40 hours. 1.5 GiB
+// covers five hours at that observed rate with more than 25% headroom and retains a hard cap.
+export const CONTINUOUS_CAPTURE_MAX_BYTES = 1536 * 1024 * 1024;
 // The scientific ledger and its frozen 99%/80% criteria remain compatible and immutable.
 export const continuousCapturePolicy = {
-  version: 2, intervalMs: 300_000, maxPendingCheckpoints: 2, uploadDeadlineMs: 120_000,
+  version: 3, intervalMs: 300_000, maxPendingCheckpoints: 2, uploadDeadlineMs: 120_000,
+  maxBytes: CONTINUOUS_CAPTURE_MAX_BYTES,
   rawRunScope: 'owned-block', startup: 'in-band-subscription-health',
   qualityFailure: 'archive-and-continue', scientificWindows: 'original-30-minute-bounds',
 } as const;
 export const CONTINUOUS_CAPTURE_POLICY_HASH = hashStudyValue(continuousCapturePolicy);
+function supportedContinuousPolicyHash(value: string): boolean {
+  return value === CONTINUOUS_CAPTURE_POLICY_HASH || value === CONTINUOUS_CAPTURE_POLICY_V2_HASH;
+}
 function continuousAsset(asset: ReleaseAsset, archive: string): ContinuousAssetIdentity {
   const archiveSha256 = sha256File(archive);
   return { assetId: asset.id, assetName: asset.name, assetBytes: asset.size,
@@ -1147,7 +1160,7 @@ async function recordContinuousStudy(repository: string, workspace: string, args
   let previousCheckpointHash: string | null = null;
   const checkpoints: ContinuousBlockDraft['checkpoints'] = [];
   const checkpointDirectories: string[] = [];
-  const directory = await recordMarket({ ...args, maxBytes: 1024 * 1024 * 1024,
+  const directory = await recordMarket({ ...args, maxBytes: continuousCapturePolicy.maxBytes,
     checkpointIntervalMs: args.checkpointIntervalMs ?? continuousCapturePolicy.intervalMs,
     checkpointMaxPending: continuousCapturePolicy.maxPendingCheckpoints,
     checkpointUploadTimeoutMs: continuousCapturePolicy.uploadDeadlineMs,
@@ -1186,7 +1199,7 @@ async function recordContinuousStudy(repository: string, workspace: string, args
 async function publishContinuousWindows(repository: string, directory: string, source: ContinuousAssetIdentity,
   draft: ContinuousBlockDraft, workspace: string, operation?: BlockOperation): Promise<number> {
   if (draft.diagnosticOnly || !draft.plan || !draft.phase) return 0;
-  if (draft.acquisitionPolicyHash !== CONTINUOUS_CAPTURE_POLICY_HASH || draft.replayConfigHash !== replayConfigHash()
+  if (!supportedContinuousPolicyHash(draft.acquisitionPolicyHash) || draft.replayConfigHash !== replayConfigHash()
     || !sameHashes(draft.simulatorHashes, replaySourceHashes(process.cwd()))) throw new Error('Continuous processing requires its recorded implementation');
   const plan = draft.plan, identity = readManifestIdentity(directory);
   const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;

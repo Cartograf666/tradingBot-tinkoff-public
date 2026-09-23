@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, publishDailyResearchReport, recordedResearchPlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
+import { assessStudyChunk, CONTINUOUS_CAPTURE_MAX_BYTES, CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, continuousCapturePolicy, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, publishDailyResearchReport, recordedResearchPlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
@@ -11,6 +11,16 @@ import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '..
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
 }
+
+test('continuous capture capacity covers the observed five-hour high-volume rate with bounded headroom', () => {
+  const observedBytesPerSecond = 67_711.99031119088;
+  const fiveHoursAtObservedRate = observedBytesPerSecond * 5 * 60 * 60;
+  assert.equal(continuousCapturePolicy.maxBytes, CONTINUOUS_CAPTURE_MAX_BYTES);
+  assert.ok(CONTINUOUS_CAPTURE_MAX_BYTES >= fiveHoursAtObservedRate * 1.25);
+  assert.ok(CONTINUOUS_CAPTURE_MAX_BYTES < 2 * 1024 * 1024 * 1024, 'capture remains bounded below 2 GiB');
+  assert.notEqual(CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH,
+    'capacity changes are represented in immutable acquisition provenance');
+});
 
 test('legacy daily research restores full API bounds, never the partial recording bounds or another date', () => {
   const instruments = [{ exchange: 'MOEX' }];

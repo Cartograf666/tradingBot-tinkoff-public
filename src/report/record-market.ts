@@ -92,6 +92,9 @@ export function recorderFailure(error: unknown, stage: string): {
   operation?: MetadataOperation; attempt?: number;
 } {
   if (error instanceof CheckpointQueueError) return { code: null, stage: 'checkpoint', category: error.category, retryable: false };
+  if (error instanceof Error && /^Recording exceeds maxBytes=\d+$/.test(error.message)) {
+    return { code: null, stage, category: 'CAPACITY_EXHAUSTED', retryable: false };
+  }
   const diagnostic = error instanceof MetadataRequestFailure ? error.diagnostic : classifyMetadataError(error);
   const retryable = stage === 'metadata' && ['TIMEOUT', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(diagnostic.classification);
   return { code: diagnostic.code, stage, category: diagnostic.classification, retryable,

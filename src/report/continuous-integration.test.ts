@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { CONTINUOUS_CAPTURE_POLICY_HASH, materializeStudyInputs } from './market-study.js';
+import { CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, materializeStudyInputs } from './market-study.js';
 import { STUDY_RELEASE_TAG } from '../research/study-protocol.js';
 import type { StudyChunkReceipt } from '../research/study-state.js';
 const sha = (data: Buffer) => createHash('sha256').update(data).digest('hex');
@@ -34,7 +34,7 @@ test('two scientific references restore one verified raw run, without duplicate 
     const view = path.join(root, `view-${index}`); mkdirSync(view);
     const name = `study-2026-09-17-early-0${index}-1-1.tar.gz`;
     writeFileSync(path.join(view, 'continuous-reference.json'), JSON.stringify({ schemaVersion: 1, kind: 'CONTINUOUS_WINDOW',
-      acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH, source, ...identity }));
+      acquisitionPolicyHash: index === 1 ? CONTINUOUS_CAPTURE_POLICY_HASH : CONTINUOUS_CAPTURE_POLICY_V2_HASH, source, ...identity }));
     writeFileSync(path.join(view, 'study-chunk-receipt.json'), JSON.stringify(identity));
     const asset = makeAsset(view, name, 100 + index); assets.push(asset);
     receipts.push({ ...identity, assetId: asset.id, assetName: name, assetBytes: asset.size,
