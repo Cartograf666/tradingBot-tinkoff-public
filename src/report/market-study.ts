@@ -11,7 +11,8 @@ import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { TINKOFF_SANDBOX_ENDPOINT } from '../core/tinkoff-client.js';
 import { confirmImmutableAsset } from './immutable-asset.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
-import { closedPlansNeedingFinalization, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
+import { closedPlansNeedingFinalization, confirmOperationCheckpoint, continuousOperationFailureStage, continuousRecordingCompleted, markOperationRecordingStopped,
+  mergeBlockOperations, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
 import { readStudyRuntime } from './study-runtime.js';
 import { fixedReplayScenarios, replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
 import { buildDailyResearchReport, dailyResearchIdentity, renderDailyResearchReport, selectDailyResearchInputs } from './daily-research.js';
@@ -679,7 +680,8 @@ export function studyStartupDeadline(plan: StudyBlockPlan, nowMs: number): numbe
     : Math.min(Date.parse(plan.ownedStart) + STUDY_LAUNCH_LATENESS_MS, Date.parse(plan.ownedEnd));
 }
 
-type BlockResult = { action: 'CAPTURED'; plan: StudyBlockPlan; chunks: number; reportPath: string | null }
+type BlockResult = { action: 'CAPTURED'; plan: StudyBlockPlan; chunks: number; reportPath: string | null;
+    rawBlockConfirmed?: boolean; scientificProcessing?: 'DEFERRED_TO_REPORT' }
   | { action: 'SKIPPED'; reason: string; chunks: 0; reportPath: string | null };
 export function studyRecorderArguments(workspace: string, chunk: StudyChunkPlan, nowMs: number, signal: AbortSignal): RecorderArguments {
   const seconds = chunkDurationSeconds(chunk, nowMs);
@@ -696,8 +698,17 @@ async function saveOperation(repository: string, operation: BlockOperation): Pro
   if (!/^\d+:\d+$/.test(operation.attemptId)) throw new Error('Invalid operational attempt identity');
   const file = `operations/${operation.attemptId.replace(':', '-')}.json`;
   operation.updatedAt = new Date().toISOString();
-  const remote = await readRemoteText(repository, file);
-  await putRemoteFile(repository, file, `${JSON.stringify(operation, null, 2)}\n`, remote.sha, 'Update capture operational evidence');
+  for (let retry = 0; retry < 5; retry += 1) {
+    const remote = await readRemoteText(repository, file);
+    const desired = remote.value ? mergeBlockOperations(JSON.parse(remote.value) as BlockOperation, operation) : structuredClone(operation);
+    try {
+      await putRemoteFile(repository, file, `${JSON.stringify(desired, null, 2)}\n`, remote.sha, 'Update capture operational evidence');
+      Object.assign(operation, desired); return;
+    } catch (error) {
+      if (![409, 422].includes(ghErrorStatus(error) ?? 0)) throw error;
+      if (retry === 4) throw new Error('Operation optimistic update failed after retries');
+    }
+  }
 }
 
 /** Runs without broker access, including after a crashed job or on the next morning. */
@@ -1125,6 +1136,12 @@ function continuousAsset(asset: ReleaseAsset, archive: string): ContinuousAssetI
   return { assetId: asset.id, assetName: asset.name, assetBytes: asset.size,
     assetDigest: asset.digest ?? `sha256:${archiveSha256}`, archiveSha256 };
 }
+
+/** Operational status is best-effort before archival; it must never prevent raw preservation. */
+export async function preserveContinuousRaw<T>(persistStopped: () => Promise<void>, preserveRaw: () => Promise<T>): Promise<T> {
+  try { await persistStopped(); } catch { /* The mandatory raw archive still runs. */ }
+  return preserveRaw();
+}
 function validateContinuousAsset(value: ContinuousAssetIdentity): void {
   if (!Number.isSafeInteger(value.assetId) || value.assetId <= 0 || !Number.isSafeInteger(value.assetBytes) || value.assetBytes <= 0
     || !/^[a-zA-Z0-9_.-]+\.tar\.gz$/.test(value.assetName) || !/^[a-f0-9]{64}$/.test(value.archiveSha256)
@@ -1177,8 +1194,8 @@ async function recordContinuousStudy(repository: string, workspace: string, args
       previousCheckpointHash = prepared.checkpointHash;
       checkpointDirectories.push(prepared.directory);
       if (operation) {
-        operation.checkpoints = checkpoints.map(item => ({ index: item.index, assetId: item.assetId,
-          lastReceivedAt: item.lastReceivedAt, confirmedAt: new Date().toISOString() }));
+        confirmOperationCheckpoint(operation, { index: checkpoint.segment.index, assetId: asset.id,
+          lastReceivedAt: checkpoint.segment.lastReceivedAt, confirmedAt: new Date().toISOString() });
         const current = operation.plan.chunks.find(chunk => Date.parse(chunk.plannedEnd) > Date.parse(checkpoint.segment.lastReceivedAt));
         operation.currentChunkIndex = current?.index;
         await saveOperation(repository, operation);
@@ -1186,18 +1203,25 @@ async function recordContinuousStudy(repository: string, workspace: string, args
       appendStudySummary(`Контрольная точка ${checkpoint.segment.index}: приватный архив подтверждён, поток продолжается.`);
     },
   }, process.cwd());
+  const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;
+  let persistStopped = async () => {};
+  if (operation && continuousRecordingCompleted(manifest.status, manifest.capture?.reason)) {
+    markOperationRecordingStopped(operation, manifest.completedAt ?? new Date().toISOString());
+    persistStopped = () => saveOperation(repository, operation);
+  }
   const block: ContinuousBlockDraft = { ...draft, checkpoints };
   atomicJson(path.join(directory, 'continuous-block.json'), block);
-  const manifest = JSON.parse(readFileSync(path.join(directory, 'manifest.json'), 'utf8')) as ObservationManifest;
-  // Preserve raw input even if acquisition or later scientific processing failed.
-  const archive = await archiveChunk(directory, `continuous-block-${manifest.runId}.tar.gz`);
-  const asset = await uploadConfirmedAsset(repository, archive);
-  return { directory, block, manifest, source: continuousAsset(asset, archive), checkpointDirectories };
+  return preserveContinuousRaw(persistStopped, async () => {
+    // Preserve raw input even if acquisition or later scientific processing failed.
+    const archive = await archiveChunk(directory, `continuous-block-${manifest.runId}.tar.gz`);
+    const asset = await uploadConfirmedAsset(repository, archive);
+    return { directory, block, manifest, source: continuousAsset(asset, archive), checkpointDirectories };
+  });
 }
 
 /** Scientific windows refer to one immutable run; they do not duplicate events or reset replay. */
 async function publishContinuousWindows(repository: string, directory: string, source: ContinuousAssetIdentity,
-  draft: ContinuousBlockDraft, workspace: string, operation?: BlockOperation): Promise<number> {
+  draft: ContinuousBlockDraft, workspace: string): Promise<number> {
   if (draft.diagnosticOnly || !draft.plan || !draft.phase) return 0;
   if (!supportedContinuousPolicyHash(draft.acquisitionPolicyHash) || draft.replayConfigHash !== replayConfigHash()
     || !sameHashes(draft.simulatorHashes, replaySourceHashes(process.cwd()))) throw new Error('Continuous processing requires its recorded implementation');
@@ -1230,25 +1254,45 @@ async function publishContinuousWindows(repository: string, directory: string, s
     const asset = await uploadConfirmedAsset(repository, archive);
     const receipt: StudyChunkReceipt = { ...receiptDraft, ...continuousAsset(asset, archive) };
     ledger = await updateRemoteLedger(repository, current => acceptStudyChunk(current, receipt), `Accept continuous window ${receipt.chunkId}`);
-    if (operation) {
-      operation.parts.push({ index: assessment.index, status: 'SAVED', assetId: asset.id, quality: assessment.quality,
-        reasons: Object.entries(assessment.checks).filter(([, ok]) => !ok).map(([check]) => check) });
-      await saveOperation(repository, operation);
-    }
     saved += 1;
   }
   return saved;
 }
 
+async function syncRecoveredOperation(repository: string, attemptId: string, ledger: StudyLedger): Promise<void> {
+  const file = `operations/${attemptId.replace(':', '-')}.json`, remote = await readRemoteText(repository, file);
+  if (!remote.value) return;
+  const operation = JSON.parse(remote.value) as BlockOperation;
+  if (operation.attemptId !== attemptId || operation.state === 'STARTING' || operation.state === 'CAPTURING') return;
+  let changed = false;
+  for (const receipt of ledger.chunks.filter(item => item.attemptId === attemptId)) {
+    if (!operation.parts.some(part => part.index === receipt.chunkIndex || part.assetId === receipt.assetId)) {
+      operation.parts.push({ index: receipt.chunkIndex, status: 'SAVED', assetId: receipt.assetId,
+        quality: receipt.quality, reasons: [] });
+      changed = true;
+    }
+  }
+  const complete = operation.plan.chunks.every(chunk => ledger.chunks.some(receipt => receipt.attemptId === attemptId
+    && receipt.block === operation.plan.block && receipt.chunkIndex === chunk.index
+    && receipt.plannedStart === chunk.plannedStart && receipt.plannedEnd === chunk.plannedEnd));
+  if (complete && operation.state === 'PROCESSING') { operation.state = 'FINISHED'; changed = true; }
+  if (changed) await saveOperation(repository, operation);
+}
+
 /** Recovery of a finished raw upload before all scientific references were committed. */
-async function reconcileContinuousBlocks(repository: string, workspace: string): Promise<number> {
+export async function reconcileContinuousBlocks(repository: string, workspace: string): Promise<number> {
   let failures = 0;
   let ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
   for (const asset of (await releaseAssets(repository)).filter(item => item.name.startsWith('continuous-block-'))) {
     try {
     // Every source has a private completion marker only after all window receipts are committed.
     const markerPath = `continuous-completed/${asset.id}.json`;
-    if ((await readRemoteText(repository, markerPath)).value) continue;
+    const marker = await readRemoteText(repository, markerPath);
+    if (marker.value) {
+      const saved = JSON.parse(marker.value) as { attemptId?: string };
+      if (saved.attemptId) await syncRecoveredOperation(repository, saved.attemptId, ledger);
+      continue;
+    }
     const archive = path.join(workspace, asset.name);
     await downloadAsset(repository, asset.id, archive);
     const source = continuousAsset(asset, archive);
@@ -1261,15 +1305,32 @@ async function reconcileContinuousBlocks(repository: string, workspace: string):
       if (!ledger.attempts.some(item => item.attemptId === draft.attemptId)) throw new Error('Continuous block has no persisted attempt');
       await publishContinuousWindows(repository, directory, source, draft, workspace);
       ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+      const plan = draft.plan;
+      if (!plan || !plan.chunks.every(chunk => ledger.chunks.some(receipt => receipt.attemptId === draft.attemptId
+        && receipt.block === plan.block && receipt.chunkIndex === chunk.index
+        && receipt.plannedStart === chunk.plannedStart && receipt.plannedEnd === chunk.plannedEnd))) {
+        throw new Error('Continuous windows are not fully committed');
+      }
     }
     await putRemoteFile(repository, markerPath, `${JSON.stringify({ assetId: asset.id, archiveSha256: source.archiveSha256,
-      diagnosticOnly: draft.diagnosticOnly, status: manifest.status })}\n`, null, 'Confirm continuous block recovery');
+      attemptId: draft.attemptId, diagnosticOnly: draft.diagnosticOnly, status: manifest.status })}\n`, null, 'Confirm continuous block recovery');
+    if (!draft.diagnosticOnly && manifest.status === 'COMPLETE') await syncRecoveredOperation(repository, draft.attemptId, ledger);
     } catch {
       failures += 1;
       appendStudySummary(`Архив ${asset.id}: обработка не восстановлена; источник сохранён и не засчитан. Остальные сводки продолжаются.`);
     }
   }
   return failures;
+}
+
+async function continuousBlockProcessing(repository: string, ledger: StudyLedger, plan: StudyBlockPlan): Promise<boolean> {
+  for (const attempt of ledger.attempts.filter(item => item.sessionDate === plan.sessionDate && item.block === plan.block)) {
+    const remote = await readRemoteText(repository, `operations/${attempt.attemptId.replace(':', '-')}.json`);
+    if (!remote.value) continue;
+    const operation = JSON.parse(remote.value) as BlockOperation;
+    if (operation.attemptId === attempt.attemptId && operation.state === 'PROCESSING') return true;
+  }
+  return false;
 }
 
 export async function captureContinuousStudyBlock(repository: string, block: StudyBlock, workspace: string,
@@ -1284,6 +1345,9 @@ export async function captureContinuousStudyBlock(repository: string, block: Stu
   if (!plan) return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
   const decision = planStudyRun(recovered, { event: 'schedule', campaignEnabled: true, runId, runAttempt, sessionDate: plan.sessionDate });
   if (decision.action !== 'CAPTURE') return { action: 'SKIPPED', reason: decision.action, chunks: 0, reportPath: null };
+  if (await continuousBlockProcessing(repository, recovered, plan)) {
+    return { action: 'SKIPPED', reason: 'BLOCK_PROCESSING', chunks: 0, reportPath: null };
+  }
   if (studyBlockRecorded(recovered, plan)) return { action: 'SKIPPED', reason: 'BLOCK_ALREADY_RECORDED', chunks: 0,
     reportPath: await maybeFinalizeStudyDay(repository, plan, workspace) };
   assertFrozenRuntime(recovered);
@@ -1311,15 +1375,13 @@ export async function captureContinuousStudyBlock(repository: string, block: Stu
       Math.ceil((stopAt - Date.now()) / 1000), 'main'), captureDeadlineMs: stopAt, parentSignal: signal, setExitCodeOnFailure: false },
     { schemaVersion: 1, kind: 'CONTINUOUS_BLOCK', acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH,
       attemptId, diagnosticOnly: false, plan, phase, replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()) }, operation);
-    operation.recordingStoppedAt = new Date().toISOString(); await saveOperation(repository, operation);
     if (result.manifest.status !== 'COMPLETE' || result.manifest.capture?.reason !== 'duration') throw new Error('Continuous capture incomplete; durable raw evidence preserved');
-    const chunks = await publishContinuousWindows(repository, result.directory, result.source, result.block, workspace, operation);
-    const reportPath = await maybeFinalizeStudyDay(repository, plan, workspace);
-    operation.state = 'FINISHED'; await saveOperation(repository, operation);
-    return { action: 'CAPTURED', plan, chunks, reportPath };
+    operation.state = 'PROCESSING'; await saveOperation(repository, operation);
+    return { action: 'CAPTURED', plan, chunks: 0, reportPath: null,
+      rawBlockConfirmed: true, scientificProcessing: 'DEFERRED_TO_REPORT' };
   } catch (error) {
     operation.state = signal.aborted ? 'CANCELLED' : 'FAILED';
-    operation.failure = operation.recordingStoppedAt ? 'STORAGE_OR_PROCESSING' : 'RECORDING';
+    operation.failure = continuousOperationFailureStage(operation);
     try { await saveOperation(repository, operation); } catch { /* Private release assets remain authoritative. */ }
     appendStudySummary('Непрерывный сбор прерван. Подтверждённые контрольные точки сохранены; неполный день не засчитывается.');
     throw error;
@@ -1424,7 +1486,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       if (process.env.GITHUB_STEP_SUMMARY) {
         const summary = result.action === 'SKIPPED'
           ? `### Сбор пропущен\n\nПричина: \`${result.reason}\`. Эта задача не создала новую попытку записи. Успех служебного запуска не означает собранный торговый день.\n`
-          : `### Блок записан\n\nПодтверждено новых частей: ${result.chunks}. Полнота дня оценивается отдельной проверкой данных.\n`;
+          : result.scientificProcessing === 'DEFERRED_TO_REPORT'
+            ? '### Исходный блок подтверждён\n\nНепрерывный архив сохранён приватно. Научные окна обрабатываются отдельной восстанавливаемой задачей; до её завершения блок не считается полностью обработанным.\n'
+            : `### Блок записан\n\nПодтверждено новых частей: ${result.chunks}. Полнота дня оценивается отдельной проверкой данных.\n`;
         writeFileSync(process.env.GITHUB_STEP_SUMMARY, summary, { flag: 'a' });
       }
       console.log(JSON.stringify(result)); return;

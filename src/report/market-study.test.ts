@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, CONTINUOUS_CAPTURE_MAX_BYTES, CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, continuousCapturePolicy, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, publishDailyResearchReport, recordedResearchPlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
+import { assessStudyChunk, CONTINUOUS_CAPTURE_MAX_BYTES, CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, continuousCapturePolicy, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, preserveContinuousRaw, publishDailyResearchReport, recordedResearchPlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
 import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
@@ -352,6 +352,35 @@ test('primary market commands share one capture lock; bounded pilot has its own 
   assert.match(reports, /actions: read/);
   assert.match(reports, /STUDY_ACTIONS_TOKEN: \$\{\{ github.token \}\}/);
   assert.doesNotMatch(reports, /TINKOFF_API_TOKEN|market-study-capture/);
+});
+
+test('continuous campaign releases the capture lock after raw confirmation and defers scientific windows', () => {
+  const source = readFileSync(path.resolve('src/report/market-study.ts'), 'utf8');
+  const capture = source.split('export async function captureContinuousStudyBlock')[1].split('async function continuousPilot')[0];
+  assert.match(capture, /rawBlockConfirmed: true, scientificProcessing: 'DEFERRED_TO_REPORT'/);
+  assert.doesNotMatch(capture, /publishContinuousWindows/);
+  assert.match(capture, /operation\.state = 'PROCESSING'/);
+  assert.match(capture, /continuousOperationFailureStage\(operation\)/);
+  const recorder = source.split('async function recordContinuousStudy')[1].split('async function publishContinuousWindows')[0];
+  assert.ok(recorder.indexOf('markOperationRecordingStopped') < recorder.indexOf('archiveChunk(directory, `continuous-block-'),
+    'recording stop evidence must precede raw compression and upload');
+});
+
+test('raw preservation still runs after operational-state failure and propagates archive failure', async () => {
+  const calls: string[] = [];
+  const saved = await preserveContinuousRaw(async () => { calls.push('operation'); throw new Error('state unavailable'); },
+    async () => { calls.push('raw'); return 'confirmed'; });
+  assert.equal(saved, 'confirmed'); assert.deepEqual(calls, ['operation', 'raw']);
+  await assert.rejects(preserveContinuousRaw(async () => {}, async () => { throw new Error('raw upload failed'); }), /raw upload failed/);
+});
+
+test('continuous reconciliation commits every receipt before its retry marker', () => {
+  const source = readFileSync(path.resolve('src/report/market-study.ts'), 'utf8');
+  const recovery = source.split('async function reconcileContinuousBlocks')[1].split('async function continuousBlockProcessing')[0];
+  assert.match(recovery, /Continuous windows are not fully committed/);
+  assert.ok(recovery.indexOf('Continuous windows are not fully committed') < recovery.indexOf('Confirm continuous block recovery'));
+  assert.match(recovery, /attemptId: draft\.attemptId/);
+  assert.match(recovery, /syncRecoveredOperation/);
 });
 
 // Reproduces the campaign caller bug: preparation must consume, not extend, the owned slot.

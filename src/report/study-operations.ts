@@ -9,7 +9,7 @@ export interface BlockOperation {
   plan: StudyBlockPlan;
   startedAt: string;
   updatedAt: string;
-  state: 'STARTING' | 'CAPTURING' | 'FINISHED' | 'FAILED' | 'CANCELLED';
+  state: 'STARTING' | 'CAPTURING' | 'PROCESSING' | 'FINISHED' | 'FAILED' | 'CANCELLED';
   failure: 'STARTUP' | 'RECORDING' | 'STORAGE_OR_PROCESSING' | null;
   currentChunkIndex?: number;
   captureFormat?: 'continuous-v2';
@@ -19,6 +19,67 @@ export interface BlockOperation {
   captureStartedAt?: string;
   parts: Array<{ index: number; status: 'SAVED' | 'RECORDING_FAILED'; assetId: number;
     quality: 'PASS' | 'INSUFFICIENT_DATA' | null; reasons: string[] }>;
+}
+
+type ConfirmedCheckpoint = NonNullable<BlockOperation['checkpoints']>[number];
+
+/** Checkpoint confirmation times are immutable evidence of each individual upload. */
+export function confirmOperationCheckpoint(operation: BlockOperation, checkpoint: ConfirmedCheckpoint): void {
+  if (!Number.isSafeInteger(checkpoint.index) || checkpoint.index <= 0 || !Number.isSafeInteger(checkpoint.assetId)
+    || checkpoint.assetId <= 0 || !Number.isFinite(Date.parse(checkpoint.lastReceivedAt))
+    || !Number.isFinite(Date.parse(checkpoint.confirmedAt))) throw new Error('Invalid operation checkpoint');
+  const current = operation.checkpoints?.find(item => item.index === checkpoint.index || item.assetId === checkpoint.assetId);
+  if (current) {
+    if (JSON.stringify(current) !== JSON.stringify(checkpoint)) throw new Error('Conflicting operation checkpoint');
+    return;
+  }
+  (operation.checkpoints ??= []).push({ ...checkpoint });
+  operation.checkpoints.sort((a, b) => a.index - b.index);
+}
+
+/** The stream stopped before raw compression/upload and later scientific processing begin. */
+export function markOperationRecordingStopped(operation: BlockOperation, stoppedAt: string): void {
+  if (!Number.isFinite(Date.parse(stoppedAt))) throw new Error('Invalid recording stop time');
+  if (operation.recordingStoppedAt && operation.recordingStoppedAt !== stoppedAt) throw new Error('Conflicting recording stop time');
+  operation.recordingStoppedAt = stoppedAt;
+}
+
+export function continuousOperationFailureStage(operation: BlockOperation): 'RECORDING' | 'STORAGE_OR_PROCESSING' {
+  return operation.recordingStoppedAt ? 'STORAGE_OR_PROCESSING' : 'RECORDING';
+}
+
+export function continuousRecordingCompleted(status: string, reason: string | undefined): boolean {
+  return status === 'COMPLETE' && reason === 'duration';
+}
+
+/** Merge a stale reporter view without erasing newer capture evidence. */
+export function mergeBlockOperations(current: BlockOperation, incoming: BlockOperation): BlockOperation {
+  if (current.attemptId !== incoming.attemptId || current.schemaVersion !== incoming.schemaVersion
+    || JSON.stringify(current.plan) !== JSON.stringify(incoming.plan) || current.startedAt !== incoming.startedAt) {
+    throw new Error('Conflicting block operations');
+  }
+  const merged = structuredClone(current);
+  const terminal = new Set<BlockOperation['state']>(['FINISHED', 'FAILED', 'CANCELLED']);
+  if (terminal.has(current.state) && terminal.has(incoming.state) && current.state !== incoming.state) {
+    throw new Error('Conflicting terminal block operations');
+  }
+  const rank: Record<BlockOperation['state'], number> = { STARTING: 0, CAPTURING: 1, PROCESSING: 2, FINISHED: 3, FAILED: 3, CANCELLED: 3 };
+  if (rank[incoming.state] > rank[merged.state]) merged.state = incoming.state;
+  merged.failure = current.failure ?? incoming.failure;
+  merged.captureFormat ??= incoming.captureFormat;
+  merged.checkpointIntervalMs ??= incoming.checkpointIntervalMs;
+  merged.captureStartedAt ??= incoming.captureStartedAt;
+  merged.recordingStoppedAt ??= incoming.recordingStoppedAt;
+  merged.currentChunkIndex = Math.max(current.currentChunkIndex ?? 0, incoming.currentChunkIndex ?? 0) || undefined;
+  for (const checkpoint of incoming.checkpoints ?? []) confirmOperationCheckpoint(merged, checkpoint);
+  for (const part of incoming.parts) {
+    const existing = merged.parts.find(item => item.index === part.index || item.assetId === part.assetId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(part)) throw new Error('Conflicting operation part');
+    if (!existing) merged.parts.push(structuredClone(part));
+  }
+  merged.parts.sort((a, b) => a.index - b.index);
+  merged.updatedAt = current.updatedAt > incoming.updatedAt ? current.updatedAt : incoming.updatedAt;
+  return merged;
 }
 
 /** Runtime evidence is fresh API data; a stored CAPTURING flag alone never proves liveness. */
@@ -32,6 +93,7 @@ export function collectorStatus(operations: BlockOperation[], date: string, now:
   const capture = runtime.runs.find(run => run.captureCommandRunning && ['arm', 'campaign'].includes(run.mode));
   if (capture) {
     const operation = current.find(op => op.attemptId.split(':')[0] === capture.runId);
+    if (operation?.state === 'PROCESSING') return { ...base, status: 'PROCESSING', reason: 'SCIENTIFIC_PROCESSING_PENDING' };
     if (operation?.state === 'CAPTURING') {
       if (operation.captureFormat === 'continuous-v2') {
         if (operation.recordingStoppedAt) return { ...base, status: 'PROCESSING' };
@@ -56,6 +118,7 @@ export function collectorStatus(operations: BlockOperation[], date: string, now:
   if (runtime.runs.some(run => run.captureCommandRunning)) return { ...base, status: 'DIAGNOSTIC' };
   if (runtime.runs.some(run => run.captureJobRunning)) return { ...base, status: 'STARTING' };
   if (runtime.runs.some(run => run.preparing || run.queued)) return { ...base, status: 'WAITING' };
+  if (current[0]?.state === 'PROCESSING') return { ...base, status: 'PROCESSING', reason: 'SCIENTIFIC_PROCESSING_PENDING' };
   return { ...base, status: current[0] && ['STARTING', 'CAPTURING', 'FAILED', 'CANCELLED'].includes(current[0].state) ? 'STOPPED' : 'IDLE' };
 }
 

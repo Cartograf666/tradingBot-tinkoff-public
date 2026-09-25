@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { closedPlansNeedingFinalization, collectorStatus, operationalDay, recordOwnedSlot, recoverableRecordingFailure, renderOperationalDay, type BlockOperation } from './study-operations.js';
+import { closedPlansNeedingFinalization, collectorStatus, confirmOperationCheckpoint, continuousOperationFailureStage, continuousRecordingCompleted,
+  markOperationRecordingStopped, mergeBlockOperations, operationalDay, recordOwnedSlot, recoverableRecordingFailure,
+  renderOperationalDay, type BlockOperation } from './study-operations.js';
 import { createStudyLedger } from '../research/study-state.js';
 import { planStudyBlock } from '../research/study-protocol.js';
 import type { StudyRuntimeSnapshot } from './study-runtime.js';
@@ -52,6 +54,7 @@ test('runtime separates waiting, startup and diagnostic commands from canonical 
   assert.equal(status({ ...activeRun, captureCommandRunning: false, captureJobRunning: false, queued: true }), 'WAITING');
   assert.equal(status({ ...activeRun, captureCommandRunning: false }), 'STARTING');
   assert.equal(status(activeRun, operation('STARTING')), 'STARTING');
+  assert.equal(status(activeRun, operation('PROCESSING')), 'PROCESSING');
   assert.equal(status({ ...activeRun, mode: 'observe', block: null }), 'DIAGNOSTIC');
   assert.equal(status(activeRun), 'CAPTURING');
 });
@@ -136,4 +139,42 @@ test('continuous liveness uses confirmed checkpoint cadence and distinguishes pr
   assert.equal(collectorStatus([{ ...op, recordingStoppedAt: `${reportDate}T12:11:00Z` }], reportDate,
     Date.parse(`${reportDate}T12:19:00Z`), live).status, 'PROCESSING');
   assert.equal(collectorStatus([op], reportDate, reportNow, runtime()).status, 'STOPPED');
+});
+
+test('checkpoint confirmations keep their original upload times across later updates', () => {
+  const op = operation();
+  confirmOperationCheckpoint(op, { index: 1, assetId: 901, lastReceivedAt: `${reportDate}T12:10:00Z`, confirmedAt: `${reportDate}T12:10:04Z` });
+  confirmOperationCheckpoint(op, { index: 2, assetId: 902, lastReceivedAt: `${reportDate}T12:15:00Z`, confirmedAt: `${reportDate}T12:15:09Z` });
+  assert.deepEqual(op.checkpoints?.map(item => item.confirmedAt), [`${reportDate}T12:10:04Z`, `${reportDate}T12:15:09Z`]);
+  assert.throws(() => confirmOperationCheckpoint(op, { index: 1, assetId: 999,
+    lastReceivedAt: `${reportDate}T12:10:00Z`, confirmedAt: `${reportDate}T12:20:00Z` }), /Conflicting/);
+});
+
+test('recording completion separates recorder failures from raw storage failures', () => {
+  const recorderFailure = operation();
+  assert.equal(continuousOperationFailureStage(recorderFailure), 'RECORDING');
+  const storageFailure = operation();
+  markOperationRecordingStopped(storageFailure, `${reportDate}T12:11:00Z`);
+  assert.equal(continuousOperationFailureStage(storageFailure), 'STORAGE_OR_PROCESSING');
+  assert.equal(continuousRecordingCompleted('COMPLETE', 'duration'), true);
+  assert.equal(continuousRecordingCompleted('COMPLETE', 'abort'), false);
+  assert.equal(continuousRecordingCompleted('FAILED', 'duration'), false);
+});
+
+test('stale processing updates cannot erase finished state, checkpoints or recovered parts', () => {
+  const finished = { ...operation('FINISHED'), recordingStoppedAt: `${reportDate}T12:11:00Z`,
+    checkpoints: [{ index: 1, assetId: 901, lastReceivedAt: `${reportDate}T12:10:00Z`, confirmedAt: `${reportDate}T12:10:04Z` }],
+    parts: [{ index: 1, status: 'SAVED' as const, assetId: 1001, quality: 'PASS' as const, reasons: [] }] };
+  const stale = { ...operation('PROCESSING'), updatedAt: `${reportDate}T12:12:00Z`,
+    checkpoints: [{ index: 2, assetId: 902, lastReceivedAt: `${reportDate}T12:15:00Z`, confirmedAt: `${reportDate}T12:15:09Z` }] };
+  const merged = mergeBlockOperations(finished, stale);
+  assert.equal(merged.state, 'FINISHED');
+  assert.deepEqual(merged.checkpoints?.map(item => item.assetId), [901, 902]);
+  assert.equal(merged.parts.length, 1);
+});
+
+test('deferred scientific processing stays visible after the capture command exits', () => {
+  const op = operation('PROCESSING');
+  const status = collectorStatus([op], reportDate, reportNow, runtime());
+  assert.equal(status.status, 'PROCESSING'); assert.equal(status.reason, 'SCIENTIFIC_PROCESSING_PENDING');
 });
