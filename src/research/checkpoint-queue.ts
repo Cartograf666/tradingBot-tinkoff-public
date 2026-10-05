@@ -1,6 +1,9 @@
 /** A bounded, sequential uploader. Acquisition never waits for network I/O. */
+import { CheckpointStorageFailure, type CheckpointStorageDiagnostic } from '../report/checkpoint-diagnostic.js';
+
 export class CheckpointQueueError extends Error {
-  constructor(readonly category: 'CHECKPOINT_OVERFLOW' | 'CHECKPOINT_UPLOAD_FAILED' | 'CHECKPOINT_TIMEOUT') {
+  constructor(readonly category: 'CHECKPOINT_OVERFLOW' | 'CHECKPOINT_UPLOAD_FAILED' | 'CHECKPOINT_TIMEOUT',
+    readonly storage?: CheckpointStorageDiagnostic) {
     super(category);
     this.name = 'CheckpointQueueError';
   }
@@ -79,7 +82,8 @@ export class CheckpointQueue<T> {
     });
     void Promise.race([Promise.resolve().then(() => this.options.upload(item, controller.signal)), timeout, aborted])
       .catch((error: unknown) => this.fail(error instanceof CheckpointQueueError ? error
-        : new CheckpointQueueError('CHECKPOINT_UPLOAD_FAILED')))
+        : new CheckpointQueueError('CHECKPOINT_UPLOAD_FAILED',
+          error instanceof CheckpointStorageFailure ? error.diagnostic : undefined)))
       .finally(() => {
         if (timer) clearTimeout(timer);
         if (onAbort) controller.signal.removeEventListener('abort', onAbort);

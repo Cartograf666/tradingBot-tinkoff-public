@@ -4,6 +4,7 @@ import type { OrderBook, Trade } from 'tinkoff-invest-api/dist/generated/marketd
 import type { ResolvedInstrument } from '../domain/trading.js';
 import { assessBookCosts, type DepthBook } from './order-book-costs.js';
 import type { RecordingSummary } from './market-recording.js';
+import type { CaptureTimingResult } from './capture-timing.js';
 
 export type ObservationSource = 'EXCHANGE' | 'DEALER' | 'UNKNOWN';
 export type RequestedSource = 'exchange' | 'dealer' | 'all';
@@ -29,7 +30,7 @@ export interface ObservationManifest {
   codeHashes: Record<string, string>;
   notes: string[];
   completedAt?: string;
-  capture?: { reason: string; epochs: number; responses: number };
+  capture?: { reason: string; epochs: number; responses: number; timing?: CaptureTimingResult };
   recording?: RecordingSummary;
   nextSession?: { start: string; end: string } | null;
   failure?: { code: number | null; stage: string };

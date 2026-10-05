@@ -3,6 +3,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, realpathSync } from
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultSimulationConfig, OrderBookSimulator, type SimulationResult } from '../research/order-book-simulator.js';
+import { ObservedLiquidationTracker } from '../research/observed-liquidation.js';
 import { inspectReplayChunk, validateSessionChunks, consumeSessionChunks, SessionCoverage, type ReplayChunk } from '../research/session-replay.js';
 import type { ObservationManifest } from '../research/market-observation.js';
 
@@ -10,7 +11,8 @@ const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).diges
 const sourceFiles = ['src/report/replay-orderbook.ts', 'src/research/session-replay.ts',
   'src/research/continuous-windows.ts', 'src/research/continuous-checkpoints.ts',
   'src/research/order-book-simulator.ts', 'src/research/market-observation.ts',
-  'src/research/market-recording.ts', 'src/research/order-book-costs.ts', 'package-lock.json'];
+  'src/research/market-recording.ts', 'src/research/order-book-costs.ts',
+  'src/research/observed-liquidation.ts', 'package-lock.json'];
 function projectRoot() {
   let directory = path.dirname(fileURLToPath(import.meta.url));
   while (!existsSync(path.join(directory, 'package.json'))) {
@@ -44,14 +46,16 @@ export function fixedReplayScenarios() {
   ]);
 }
 export function replayConfigHash(): string { return sha(JSON.stringify(fixedReplayScenarios())); }
-function summarize(name: string, result: SimulationResult) {
+function summarize(name: string, result: SimulationResult, observedRisk: ReturnType<ObservedLiquidationTracker['result']>,
+  terminalLiquidation: ReturnType<OrderBookSimulator['liquidationSnapshot']>) {
   const winning = result.closedTrades.reduce((sum, t) => sum + Math.max(0, t.pnlRub), 0);
   const losing = result.closedTrades.reduce((sum, t) => sum - Math.min(0, t.pnlRub), 0);
   return { name, strategy: result.config.strategy, scenario: name.endsWith('-stress') ? 'stress' : 'baseline',
     signals: result.signals, entries: result.fills.filter(f => f.side === 'BUY').length,
     closedTrades: result.closedTrades.length, netPnlRub: result.openPositions.length ? null : result.realizedPnlRub,
     realizedPnlRub: result.realizedPnlRub, feesRub: result.feesRub, profitFactor: losing ? winning / losing : null,
-    maxDrawdownRub: result.maxDrawdownRub, unresolvedPositions: result.openPositions.length, economicSuccess: false as const };
+    maxDrawdownRub: result.maxDrawdownRub, unresolvedPositions: result.openPositions.length, economicSuccess: false as const,
+    observedRisk, terminalLiquidation };
 }
 export interface SessionReplayOptions { sessionDate: string; mainStart: string; mainEnd: string }
 
@@ -66,17 +70,24 @@ async function replay(chunks: ReplayChunk[], output: string, options: SessionRep
     settings: { ...ordered[0].manifest.settings, durationMs: end - start }, recording: undefined,
     notes: ['Derived stream: original payloads preserved; global offsets start at the API session opening; every chunk boundary invalidates market state.'] };
   const scenarios = fixedReplayScenarios(), simulators = scenarios.map(s => new OrderBookSimulator(manifest, s.config));
+  const riskTrackers = scenarios.map(s => new ObservedLiquidationTracker(s.config.initialCashRub));
   const coverage = new SessionCoverage(manifest, start, end);
   const mappings = await consumeSessionChunks(ordered, manifest, start, event => {
-    coverage.consume(event); for (const simulator of simulators) simulator.consume(event);
+    coverage.consume(event);
+    simulators.forEach((simulator, index) => {
+      simulator.consume(event);
+      riskTrackers[index].observe(simulator.liquidationSnapshot());
+    });
   });
+  const terminalLiquidations = simulators.map(s => s.liquidationSnapshot());
   const details = simulators.map(s => s.finish());
   const report = { schemaVersion: 1 as const,
     dataset: { scope, ...options, datasetHash, inputs: datasetInputs, mappings },
     configHash: replayConfigHash(), simulatorHashes: replaySourceHashes(), runtimeHashes: replayRuntimeHashes(),
-    quality: coverage.result(), results: details.map((result, i) => summarize(scenarios[i].name, result)),
+    quality: coverage.result(), results: details.map((result, i) => summarize(scenarios[i].name, result,
+      riskTrackers[i].result(), terminalLiquidations[i])),
     limitations: ['Displayed-depth IOC simulation; queue priority and market impact are not observable.',
-      'Drawdown measures realized equity at entry-cost inventory, not mark-to-market risk.',
+      'Legacy maxDrawdownRub values open inventory at entry cost; observedRisk uses only received frames with fresh, fully liquidatable displayed bid depth. Unknown intervals have no loss bound.',
       'Commission and latency are fixed scenarios, not verified account terms.',
       'Any open terminal inventory makes full net PnL unknown. A profitable replay does not establish an investable edge.'] };
   const destination = resolveOutput(output);
@@ -87,10 +98,10 @@ async function replay(chunks: ReplayChunk[], output: string, options: SessionRep
   // Exclusive output prevents silent replacement of a previous experiment.
   mkdirSync(path.dirname(destination), { recursive: true }); mkdirSync(destination);
   const number = (n: number | null) => n === null ? 'не определён' : n.toFixed(2);
-  const rows = report.results.map(r => `| ${r.name} | ${r.entries} | ${r.closedTrades} | ${number(r.netPnlRub)} | ${number(r.feesRub)} | ${r.unresolvedPositions} |`).join('\n');
+  const rows = report.results.map(r => `| ${r.name} | ${r.entries} | ${r.closedTrades} | ${number(r.netPnlRub)} | ${number(r.feesRub)} | ${r.unresolvedPositions} | ${number(r.observedRisk.maximumDrawdownRub)} | ${r.observedRisk.knownPositionSampleFraction === null ? 'нет позиций' : `${(r.observedRisk.knownPositionSampleFraction * 100).toFixed(1)}%`} |`).join('\n');
   writeFileSync(path.join(destination, 'replay.json'), `${JSON.stringify(report, null, 2)}\n`);
   writeFileSync(path.join(destination, 'fills.json'), `${JSON.stringify(details, null, 2)}\n`);
-  writeFileSync(path.join(destination, 'REPORT.md'), `# Симуляция по записанным стаканам\n\n${options.mainStart} — ${options.mainEnd}. Покрытие ${scope === 'session' ? 'всей основной сессии' : 'отдельной записи'}: ${(report.quality.recordedShare * 100).toFixed(2)}%; качество: ${report.quality.status}. Записей: ${ordered.length}.\n\n| Гипотеза и условия | Входы | Закрытия, включая частичные | Чистый результат, ₽ | Комиссии, ₽ | Незакрытые позиции |\n| --- | ---: | ---: | ---: | ---: | ---: |\n${rows}\n\nУ каждой гипотезы один капитал 100 000 ₽ на все акции и части дня, бюджет одного входа до 4 000 ₽. Покупки и продажи исполняются по первому допустимому полученному стакану после задержки: 300 мс и комиссия 0,05% на сторону в базовом сценарии; 1000 мс и 0,10% — в стрессовом. Часть заявки, которой не хватило видимой глубины, отменяется.\n\nЭто модель рыночных заявок по видимой глубине. Она не измеряет очередь и влияние своих сделок на рынок. Незакрытая позиция остаётся открытой, конечная цена не подставляется. Просадка отражает реализованный результат; риск открытых позиций ею не измеряется. Положительный результат одного дня ещё не подтверждает прибыльность стратегии.\n\n[Параметры, качество и происхождение](replay.json) · [Заявки и исполнения модели](fills.json)\n`);
+  writeFileSync(path.join(destination, 'REPORT.md'), `# Симуляция по записанным стаканам\n\n${options.mainStart} — ${options.mainEnd}. Покрытие ${scope === 'session' ? 'всей основной сессии' : 'отдельной записи'}: ${(report.quality.recordedShare * 100).toFixed(2)}%; качество: ${report.quality.status}. Записей: ${ordered.length}.\n\n| Гипотеза и условия | Входы | Закрытия, включая частичные | Чистый результат, ₽ | Комиссии, ₽ | Незакрытые позиции | Наблюдаемая просадка, ₽ | Оценённые кадры с позицией |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${rows}\n\nУ каждой гипотезы один капитал 100 000 ₽ на все акции и части дня, бюджет одного входа до 4 000 ₽. Покупки и продажи исполняются по первому допустимому полученному стакану после задержки: 300 мс и комиссия 0,05% на сторону в базовом сценарии; 1000 мс и 0,10% — в стрессовом. Часть заявки, которой не хватило видимой глубины, отменяется.\n\nЭто модель рыночных заявок по видимой глубине. Она не измеряет очередь и влияние своих сделок на рынок. Незакрытая позиция остаётся открытой, конечная цена не подставляется. Наблюдаемая просадка считает стоимость полной продажи по актуальной видимой глубине с комиссией только на полученных кадрах. При отсутствии свежего стакана или достаточной глубины оценка неизвестна; промежутки между кадрами и возможный убыток в них не ограничены. Прежняя просадка по стоимости входа сохранена отдельно в replay.json. Положительный результат одного дня ещё не подтверждает прибыльность стратегии.\n\n[Параметры, качество и происхождение](replay.json) · [Заявки и исполнения модели](fills.json)\n`);
   return report;
 }
 export type ReplayReport = Awaited<ReturnType<typeof replay>>;

@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import type { RecordedEventKind } from './market-recording.js';
+import { CaptureTiming, type CaptureTimingResult } from './capture-timing.js';
 
 export interface SubscriptionAcknowledgment {
   key: string;
@@ -18,6 +19,11 @@ export interface CaptureMarketStreamOptions {
   maxReconnects?: number;
   backoffMs?: number[];
   signal?: AbortSignal;
+  timingInstrumentUids?: string[];
+  /** Test hook for diagnostic measurements only; capture deadlines always use performance.now(). */
+  timingNowMs?: () => number;
+  /** Test hook for diagnostic failures; production creates its own bounded collector. */
+  timingCollector?: CaptureTiming;
 }
 
 export interface CaptureMarketStreamResult {
@@ -29,6 +35,7 @@ export interface CaptureMarketStreamResult {
   disconnects: number;
   gaps: number;
   ticks: number;
+  timing?: CaptureTimingResult;
 }
 
 type StopReason = 'duration' | 'aborted';
@@ -43,6 +50,7 @@ interface FailureDetails {
 interface StreamResult {
   type: 'next';
   result: IteratorResult<unknown>;
+  observedAtMs: number;
 }
 
 interface StreamError {
@@ -148,6 +156,21 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
   let gaps = 0;
   let ticks = 0;
   let stopReason: StopReason | null = null;
+  const timing = options.timingCollector ?? new CaptureTiming(options.timingInstrumentUids);
+  let timingFinalized = false;
+  let timingSnapshot: CaptureTimingResult | undefined;
+  const timingNow = (): number => {
+    try {
+      const value = options.timingNowMs?.() ?? performance.now();
+      return Number.isFinite(value) ? value : performance.now();
+    } catch { return performance.now(); }
+  };
+  const safeTiming = (): CaptureTimingResult | undefined => {
+    if (timingFinalized) return timingSnapshot;
+    timingFinalized = true;
+    try { timingSnapshot = timing.finish(); } catch { /* Optional diagnostics. */ }
+    return timingSnapshot;
+  };
 
   const record = (kind: RecordedEventKind, payload: unknown): void => {
     try {
@@ -161,6 +184,7 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
 
   const emitDueTicks = (now: number): void => {
     if (nextTickAt > now || nextTickAt > deadline) return;
+    try { timing.observeTickDeadlineDrift(now - nextTickAt); } catch { /* Optional diagnostics. */ }
     const skippedIntervals = Math.max(0, Math.floor((now - nextTickAt) / tickIntervalMs));
     nextTickIndex += skippedIntervals + 1;
     // Anchor every deadline: repeated floating-point addition can put the last tick beyond the capture end.
@@ -227,7 +251,7 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
         if (!pendingNext) {
           pendingNext = Promise.resolve()
             .then(() => iterator!.next())
-            .then<StreamResult>((result) => ({ type: 'next', result }))
+            .then<StreamResult>((result) => ({ type: 'next', result, observedAtMs: timingNow() }))
             .catch<StreamError>((error: unknown) => ({ type: 'error', error }));
         }
 
@@ -278,12 +302,15 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
           break;
         }
 
-        // Raw responses are durable before any decoding, acknowledgment filtering or deduplication.
+        const dispatchAt = timingNow();
+        // The SDK has already decoded this response. Record before acknowledgment filtering or deduplication.
         record('response', outcome.result.value);
+        const appendReturnedAt = timingNow();
         responses += 1;
         lastResponseAt = performance.now();
         emitDueTicks(lastResponseAt);
         let acknowledgments: SubscriptionAcknowledgment[];
+        const acknowledgmentStartedAt = timingNow();
         try {
           acknowledgments = options.acknowledgments(outcome.result.value);
           if (!Array.isArray(acknowledgments)
@@ -291,6 +318,9 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
             throw new Error('Invalid acknowledgment decoder result');
           }
         } catch {
+          try { timing.observeResponse(outcome.result.value, dispatchAt - outcome.observedAtMs,
+            appendReturnedAt - dispatchAt, timingNow() - acknowledgmentStartedAt); }
+          catch { /* Optional diagnostics. */ }
           failure = { reason: 'acknowledgment_error' };
           break;
         }
@@ -302,6 +332,9 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
           }
           if (pendingSubscriptions.delete(acknowledgment.key)) acknowledgmentCount += 1;
         }
+        try { timing.observeResponse(outcome.result.value, dispatchAt - outcome.observedAtMs,
+          appendReturnedAt - dispatchAt, timingNow() - acknowledgmentStartedAt); }
+        catch { /* Optional diagnostics. */ }
       }
 
       currentController.abort();
@@ -332,6 +365,7 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
       disconnects,
       gaps,
       ticks,
+      timing: safeTiming(),
     };
   } catch (error) {
     currentController?.abort();
@@ -339,5 +373,7 @@ export async function captureMarketStream(options: CaptureMarketStreamOptions): 
     throw error;
   } finally {
     currentController?.abort();
+    // Also disable the optional histogram on the mandatory raw-write failure path.
+    safeTiming();
   }
 }

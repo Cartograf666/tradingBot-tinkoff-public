@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { defaultSimulationConfig, OrderBookSimulator } from './order-book-simulator.js';
+import { ObservedLiquidationTracker } from './observed-liquidation.js';
 import type { ObservationManifest } from './market-observation.js';
 import type { RecordedEvent } from './market-recording.js';
 
@@ -140,4 +141,78 @@ test('replay is deterministic and duplicate trade records are retained as receip
     return sim.finish();
   };
   assert.deepEqual(run(), run());
+});
+
+test('observed liquidation uses full bid depth, sale commission and reserved entry cash', () => {
+  const config = defaultSimulationConfig('momentum', { warmupMs: 0, closeBeforeEndMs: 0, latencyMs: 1,
+    signalHook: context => context.receivedAtMs === start + 100, commissionRate: .001,
+    maxHoldingMs: 99_999, takeProfitBps: 99_999, stopLossBps: 99_999 });
+  const sim = new OrderBookSimulator(manifest(), config), send = ready(sim);
+  const tracker = new ObservedLiquidationTracker(config.initialCashRub);
+  send('response', 100, book('a', 100, 99, 100, 10, 3));
+  const pending = sim.liquidationSnapshot();
+  tracker.observe(pending);
+  assert.equal(pending.cashRub, 96_000);
+  assert.equal(pending.reservedCashRub, 4_000);
+  assert.equal(pending.equityRub, 100_000);
+  send('response', 200, book('a', 200, 99, 100, 10, 3));
+  const twoLevels = book('a', 300, 95, 101, 1, 10);
+  twoLevels.orderbook.bids.push({ price: { units: 94, nano: 0 }, quantity: 2 });
+  send('response', 300, twoLevels);
+  const mark = sim.liquidationSnapshot();
+  tracker.observe(mark);
+  assert.deepEqual(mark.coverage, { positionCount: 1, fullyLiquidatablePositions: 1 });
+  assert.ok(Math.abs(mark.equityRub! - 99_824.17) < 1e-9);
+  assert.ok(Math.abs(tracker.result().maximumDrawdownRub! - 175.83) < 1e-9);
+  assert.equal(tracker.result().latestKnownEquityRub, mark.equityRub);
+  assert.equal(sim.finish().openPositions[0].lots, 3);
+});
+
+test('valuation distinguishes stale source from fresh receipt, and unknown gap from a terminal mark', () => {
+  const sim = new OrderBookSimulator(manifest(), defaultSimulationConfig('momentum', { warmupMs: 0,
+    closeBeforeEndMs: 0, latencyMs: 1, signalHook: context => context.receivedAtMs === start + 100,
+    maxHoldingMs: 99_999, takeProfitBps: 99_999, stopLossBps: 99_999 }));
+  const send = ready(sim);
+  send('response', 100, book('a', 100)); send('response', 200, book('a', 200));
+  send('response', 2_100, book('a', 300)); // source age 1,800 ms at receipt
+  assert.notEqual(sim.liquidationSnapshot().equityRub, null);
+  send('tick', 2_301); // receipt age 201 ms; source age 2,001 ms
+  assert.deepEqual(sim.liquidationSnapshot().unavailableReasons, ['STALE_SOURCE_BOOK:a']);
+  send('gap', 2_302);
+  assert.deepEqual(sim.liquidationSnapshot().unavailableReasons, ['NO_CURRENT_BOOK:a']);
+  send('stop', 2_303);
+  const terminal = sim.liquidationSnapshot();
+  assert.equal(terminal.equityRub, null);
+  const unknownOnly = new ObservedLiquidationTracker(100_000);
+  unknownOnly.observe(terminal);
+  assert.equal(unknownOnly.result().maximumDrawdownRub, null);
+  assert.equal(sim.finish().openPositions.length, 1);
+});
+
+test('valuation rejects stale receipt and incomplete sale depth; sampling cannot change fills or orders', () => {
+  const config = defaultSimulationConfig('momentum', { warmupMs: 0, closeBeforeEndMs: 0, latencyMs: 1,
+    signalHook: context => context.receivedAtMs === start + 100,
+    maxHoldingMs: 99_999, takeProfitBps: 99_999, stopLossBps: 99_999 });
+  const run = (observe: boolean) => {
+    const sim = new OrderBookSimulator(manifest(), config), send = ready(sim);
+    const tracker = new ObservedLiquidationTracker(config.initialCashRub);
+    const push = (kind: RecordedEvent['kind'], offset: number, payload: unknown = {}) => {
+      send(kind, offset, payload);
+      if (observe) tracker.observe(sim.liquidationSnapshot());
+    };
+    push('response', 100, book('a', 100, 99, 100, 10, 3));
+    push('response', 200, book('a', 200, 99, 100, 10, 3));
+    push('response', 300, book('a', 300, 99, 100, 1, 10));
+    assert.deepEqual(sim.liquidationSnapshot().unavailableReasons, ['INSUFFICIENT_BID_DEPTH:a']);
+    push('tick', 2_301);
+    assert.deepEqual(sim.liquidationSnapshot().unavailableReasons, ['STALE_RECEIPT_BOOK:a']);
+    const result = sim.finish();
+    return { result, risk: tracker.result() };
+  };
+  const withMarks = run(true), withoutMarks = run(false);
+  assert.deepEqual(withMarks.result, withoutMarks.result);
+  assert.equal(withMarks.risk.positionSamples, 3);
+  assert.equal(withMarks.risk.knownPositionSamples, 1);
+  assert.equal(withMarks.risk.unavailableReasons.INSUFFICIENT_BID_DEPTH, 1);
+  assert.equal(withMarks.risk.unavailableReasons.STALE_RECEIPT_BOOK, 1);
 });

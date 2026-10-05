@@ -99,6 +99,33 @@ test('missing chunks retain the whole-day denominator and repeated ticks cannot 
   assert.equal(quality.status, 'INSUFFICIENT_DATA');
 });
 
+test('85 missing seconds reject their 30-minute window but can pass the unchanged whole-session denominator', () => {
+  const dayMs = 10_000_000, firstWindowMs = 1_800_000;
+  const m = manifest('day', dayMs);
+  m.intervals[0]!.end = iso(dayMs + 1_000);
+  const day = new SessionCoverage(m, start, start + dayMs);
+  const window = new SessionCoverage(m, start, start + firstWindowMs);
+  let sequence = 0;
+  const push = (kind: RecordedEvent['kind'], at: number, payload: unknown = {}) => {
+    const event: RecordedEvent = { schemaVersion: 1, runId: 'day', sequence: ++sequence, connectionEpoch: 1,
+      receivedAt: iso(at), monotonicOffsetNs: String(at * 1_000_000), kind, payload };
+    day.consume(event); window.consume(event);
+  };
+  push('connect_attempt', 85_000);
+  push('response', 85_001, statuses);
+  push('response', 85_002, acks);
+  for (let second = 85; second < 10_000; second += 1) {
+    const at = second * 1_000;
+    push('response', at + 100, book(at + 100));
+    push('tick', at + 500);
+  }
+  assert.equal(window.result().status, 'INSUFFICIENT_DATA');
+  assert.equal(window.result().recordedShare, 1_715 / 1_800);
+  assert.equal(day.result().status, 'PASS');
+  assert.equal(day.result().recordedShare, .9915);
+  assert.equal(day.result().perInstrument[0]!.usableShare, .9915);
+});
+
 test('late capture never moves the day-end entry cutoff forward', async t => {
   const root = setup(t);
   const a = await inspectReplayChunk(writeChunk(root, 'a', [...frames(9_000), ['response', 9_100, book(9_100)], ['response', 9_200, book(9_200)], ['stop', 9_500]]));

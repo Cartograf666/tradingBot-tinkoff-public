@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { assessStudyChunk, CONTINUOUS_CAPTURE_MAX_BYTES, CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, continuousCapturePolicy, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, preserveContinuousRaw, publishDailyResearchReport, recordedResearchPlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, waitUntil } from './market-study.js';
+import { assessStudyChunk, CONTINUOUS_CAPTURE_MAX_BYTES, CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, continuousCaptureAdmission, continuousCapturePolicy, diagnosticStopAt, ensureStateBranch, findDraftRelease, ledgerReadme, preserveContinuousRaw, publishDailyResearchReport, recordedResearchPlan, refreshContinuousCapturePlan, remainingStudyChunks, renderSmokeCheckEvent, runAfterBlockCheck, runContinuousStartupPrecount, sandboxDiscoveryFailure, smokeQualityReasons, studyBlockRecorded, studyChunkRecorded, studyCollectionMetadata, studyRecorderArguments, studyStartupDeadline, uploadContinuousStartupDiagnostic, waitUntil } from './market-study.js';
 import { boundedCaptureDuration } from './record-market.js';
+import { checkRecordedReplayCompatibility } from './replay-compatibility.js';
 import { createStudyLedger, type StudyChunkReceipt, type StudyDayReceipt } from '../research/study-state.js';
-import { planRecoverableStudyBlock, planStudyBlock, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
+import { planRecoverableStudyBlock, planStudyBlock, STUDY_MAX_ATTEMPTS, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
 
 function http(status: number): Error & { stderr: Buffer } {
   return Object.assign(new Error(`HTTP ${status}`), { stderr: Buffer.from(`gh: failure (HTTP ${status})`) });
@@ -440,4 +443,120 @@ test('immutable recovery provenance carries original session and ownership bound
     ownedStart: `${day}T11:00:00.000Z`, ownedEnd: `${day}T15:54:59.000Z` });
   const original = planStudyBlock(day, plan.mainStart, plan.mainEnd, 'early', Date.parse(`${day}T05:50:00Z`))!;
   assert.equal(studyCollectionMetadata(original), undefined);
+});
+
+test('recorded replay compatibility requires every selected receipt to match the complete current identity', () => {
+  const current = { replayConfigHash: 'a'.repeat(64), simulatorHashes: { simulator: 'b'.repeat(64), risk: 'c'.repeat(64) } };
+  const matching = { replayConfigHash: current.replayConfigHash, simulatorHashes: { ...current.simulatorHashes } };
+  assert.deepEqual(checkRecordedReplayCompatibility([matching, matching], current), { status: 'COMPATIBLE', reasons: [] });
+  assert.deepEqual(checkRecordedReplayCompatibility([], current), {
+    status: 'RECORDED_RUNTIME_REQUIRED', reasons: ['NO_SELECTED_RECEIPTS'],
+  });
+  assert.deepEqual(checkRecordedReplayCompatibility([{ ...matching, replayConfigHash: 'd'.repeat(64) }], current), {
+    status: 'RECORDED_RUNTIME_REQUIRED', reasons: ['REPLAY_CONFIG_MISMATCH'],
+  });
+  const archivedCases: Record<string, string>[] = [{ simulator: 'b'.repeat(64) },
+    { simulator: 'b'.repeat(64), risk: 'x'.repeat(64) },
+    { ...current.simulatorHashes, extra: 'd'.repeat(64) }];
+  for (const archived of archivedCases) {
+    assert.deepEqual(checkRecordedReplayCompatibility([{ ...matching, simulatorHashes: archived }], current), {
+      status: 'RECORDED_RUNTIME_REQUIRED', reasons: ['SIMULATOR_SOURCE_MISMATCH'],
+    });
+  }
+  assert.deepEqual(checkRecordedReplayCompatibility([matching,
+    { replayConfigHash: 'd'.repeat(64), simulatorHashes: { simulator: 'b'.repeat(64) } }], current), {
+    status: 'RECORDED_RUNTIME_REQUIRED', reasons: ['REPLAY_CONFIG_MISMATCH', 'SIMULATOR_SOURCE_MISMATCH'],
+  });
+  assert.deepEqual(matching.simulatorHashes, current.simulatorHashes, 'compatibility check leaves historical receipts untouched');
+});
+
+test('startup admission rejects expired, exhausted, complete and duplicate attempts without changing the ledger', () => {
+  const date = '2026-09-17', start = `${date}T06:00:00Z`, end = `${date}T15:54:59Z`;
+  const now = Date.parse(`${date}T06:05:00Z`);
+  const plan = planRecoverableStudyBlock(date, start, end, 'early', now)!;
+  assert.equal(refreshContinuousCapturePlan(plan, 'early', now)?.block, 'early');
+  assert.equal(refreshContinuousCapturePlan(plan, 'early', Date.parse(`${date}T11:00:00Z`)), null,
+    'a slow early probe cannot switch to the late block');
+  const ledger = createStudyLedger();
+  assert.equal(continuousCaptureAdmission(ledger, plan, '900', 1, now).reason, null);
+  assert.equal(continuousCaptureAdmission(ledger, plan, '900', 1, Date.parse(plan.ownedEnd)).reason, 'NO_REMAINING_WINDOWS');
+  const duplicate = structuredClone(ledger);
+  duplicate.attempts.push({ attemptId: '900:1', runId: '900', runAttempt: 1, sessionDate: date,
+    block: 'early', phase: 'DEVELOPMENT', mode: 'COUNTED', startedAt: new Date(now).toISOString(), status: 'STARTED' });
+  assert.equal(continuousCaptureAdmission(duplicate, plan, '900', 1, now).reason, 'DUPLICATE_ATTEMPT');
+  const complete = structuredClone(ledger); complete.phase = 'COMPLETE';
+  assert.equal(continuousCaptureAdmission(complete, plan, '900', 1, now).reason, 'COMPLETE');
+  const exhausted = structuredClone(ledger);
+  for (let index = 0; index < STUDY_MAX_ATTEMPTS; index++) exhausted.attempts.push({ ...duplicate.attempts[0], attemptId: `${index}:1`, runId: String(index) });
+  assert.equal(continuousCaptureAdmission(exhausted, plan, '900', 1, now).reason, 'ATTEMPT_LIMIT');
+  assert.equal(ledger.attempts.length, 0);
+});
+
+test('startup probe confirms a private archive before the injected count; failure and abort leave count untouched', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'startup-storage-test-'));
+  const previousPath = process.env.PATH, previousFixture = process.env.STARTUP_TEST_FIXTURE;
+  t.after(() => {
+    process.env.PATH = previousPath;
+    if (previousFixture === undefined) delete process.env.STARTUP_TEST_FIXTURE;
+    else process.env.STARTUP_TEST_FIXTURE = previousFixture;
+    rmSync(root, { recursive: true, force: true });
+  });
+  const bin = path.join(root, 'bin'); mkdirSync(bin);
+  mkdirSync(path.join(root, 'assets'));
+  const fixturePath = path.join(root, 'fixture.json');
+  writeFileSync(fixturePath, JSON.stringify({ root, assets: [], failUpload: false, calls: [] }));
+  const shim = path.join(bin, 'gh');
+  writeFileSync(shim, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+const file=process.env.STARTUP_TEST_FIXTURE,f=JSON.parse(fs.readFileSync(file)),a=process.argv.slice(2),endpoint=a.find(x=>x.startsWith('/repos/'))||'';
+const save=()=>fs.writeFileSync(file,JSON.stringify(f));f.calls.push(a.slice(0,4).join(' '));
+if(a[0]==='release'&&a[1]==='upload'){
+  if(f.failUpload){save();process.stderr.write('gh: failure (HTTP 403)');process.exit(1)}
+  const src=a[3],name=path.basename(src),archive=path.join(f.root,'assets',name);fs.copyFileSync(src,archive);const bytes=fs.readFileSync(archive);
+  f.assets.push({id:101,name,size:bytes.length,state:'uploaded',digest:'sha256:'+crypto.createHash('sha256').update(bytes).digest('hex'),archive});save();process.exit(0)}
+if(a.includes('Accept: application/octet-stream')){const id=Number(endpoint.split('/').at(-1)),asset=f.assets.find(x=>x.id===id);if(!asset)process.exit(2);save();process.stdout.write(fs.readFileSync(asset.archive));process.exit(0)}
+if(endpoint==='/repos/owner/private'){save();process.stdout.write(JSON.stringify({private:true,default_branch:'main'}));process.exit(0)}
+if(/\\/releases\\?/.test(endpoint)){save();process.stdout.write(JSON.stringify([{id:9,draft:true,tag_name:'${STUDY_RELEASE_TAG}'}]));process.exit(0)}
+if(/\\/releases\\/9\\/assets\\?/.test(endpoint)){const page=Number(new URL('https://example.test'+endpoint).searchParams.get('page'))||1;save();process.stdout.write(JSON.stringify(f.assets.slice((page-1)*100,page*100).map(({archive,...x})=>x)));process.exit(0)}
+save();process.stderr.write('unexpected gh route');process.exit(2);\n`);
+  chmodSync(shim, 0o755);
+  process.env.PATH = `${bin}${path.delimiter}${previousPath}`;
+  process.env.STARTUP_TEST_FIXTURE = fixturePath;
+  const fixture = () => JSON.parse(readFileSync(fixturePath, 'utf8')) as { assets: Array<{ archive: string; name: string }>;
+    failUpload: boolean; calls: string[] };
+  let counted = 0;
+  const signal = new AbortController().signal;
+  let probeReceipt: Awaited<ReturnType<typeof uploadContinuousStartupDiagnostic>> | undefined;
+  const result = await runContinuousStartupPrecount(signal,
+    async () => { probeReceipt = await uploadContinuousStartupDiagnostic('owner/private', root, '900001', 1, signal); },
+    async () => { assert.equal(fixture().assets.length, 1, 'confirmed archive exists before count'); counted++; return 'COUNTED'; });
+  assert.equal(result, 'COUNTED'); assert.equal(counted, 1);
+  const asset = fixture().assets[0];
+  const hash = createHash('sha256').update(readFileSync(asset.archive)).digest('hex');
+  assert.equal(hash, probeReceipt?.archiveSha256);
+  assert.equal(probeReceipt?.assetName, asset.name);
+  assert.equal(probeReceipt?.assetDigest, `sha256:${hash}`);
+  const entry = execFileSync('tar', ['-tzf', asset.archive], { encoding: 'utf8' }).split('\n').find(line => line.endsWith('/startup.json'))!;
+  const diagnostic = JSON.parse(execFileSync('tar', ['-xOzf', asset.archive, entry], { encoding: 'utf8' }));
+  assert.equal(diagnostic.diagnosticOnly, true); assert.equal(diagnostic.attemptId, '900001:1');
+  assert.equal(diagnostic.acquisitionPolicyHash, CONTINUOUS_CAPTURE_POLICY_HASH);
+  assert.equal(fixture().calls.some(call => call.includes('/contents/') || call.includes('/git/ref/')), false,
+    'upload-only path never writes or reads study state');
+  const failure = fixture(); failure.failUpload = true; writeFileSync(fixturePath, JSON.stringify(failure));
+  await assert.rejects(runContinuousStartupPrecount(signal,
+    () => uploadContinuousStartupDiagnostic('owner/private', root, '900002', 1, signal),
+    async () => { counted++; return 'COUNTED'; }));
+  assert.equal(counted, 1, 'failed private upload consumes no attempt');
+  const abort = new AbortController();
+  await assert.rejects(runContinuousStartupPrecount(abort.signal,
+    async () => { abort.abort(); }, async () => { counted++; return 'COUNTED'; }));
+  assert.equal(counted, 1, 'aborted probe consumes no attempt');
+});
+
+test('continuous capture invokes the authenticated startup upload before counted ledger and operation writes', () => {
+  const source = readFileSync(path.resolve('src/report/market-study.ts'), 'utf8');
+  const capture = source.split('export async function captureContinuousStudyBlock')[1].split('async function continuousPilot')[0];
+  assert.ok(capture.indexOf('uploadContinuousStartupDiagnostic(repository, workspace, runId, runAttempt, signal)')
+    < capture.indexOf("'Begin continuous capture'"));
+  assert.ok(capture.indexOf("'Begin continuous capture'") < capture.indexOf('await saveOperation(repository, operation)'));
+  assert.match(capture, /refreshContinuousCapturePlan\(plan, block, Date\.now\(\)\)/);
 });

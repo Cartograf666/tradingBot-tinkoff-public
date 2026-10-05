@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CheckpointQueue, CheckpointQueueError } from './checkpoint-queue.js';
+import { checkpointStorageFailure } from '../report/checkpoint-diagnostic.js';
 
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
@@ -48,6 +49,23 @@ test('a failing storage request rejects the drain without exposing the upload er
     assert.equal(String(error), 'CheckpointQueueError: CHECKPOINT_UPLOAD_FAILED'); return true;
   });
   assert.equal(failures, 1);
+});
+
+test('checkpoint queue retains only allowlisted storage diagnostics across the abort path', async () => {
+  const secret = 'https://private.example/token-secret';
+  let reported: CheckpointQueueError | undefined;
+  const queue = new CheckpointQueue<number>({ upload: async () => {
+    const error = Object.assign(new Error(secret), { stderr: Buffer.from(`HTTP 503 ${secret}`) });
+    throw checkpointStorageFailure(error, 'ASSET_UPLOAD');
+  }, onFailure: error => { reported = error; } });
+  queue.enqueue(1);
+  await assert.rejects(queue.drain(), error => {
+    assert.ok(error instanceof CheckpointQueueError);
+    assert.deepEqual(error.storage, { storageStage: 'ASSET_UPLOAD', storageCategory: 'HTTP_TRANSIENT',
+      httpStatus: 503, retryable: true });
+    assert.ok(!JSON.stringify(error).includes(secret)); return true;
+  });
+  assert.equal(reported?.category, 'CHECKPOINT_UPLOAD_FAILED');
 });
 
 test('a hung storage request and graceful drain are both bounded and abort their signal', async () => {

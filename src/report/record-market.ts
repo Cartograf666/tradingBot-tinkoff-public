@@ -89,9 +89,13 @@ export function normalizeCaptureStop(payload: unknown, userAborted: boolean, now
 
 export function recorderFailure(error: unknown, stage: string): {
   code: number | null; stage: string; category: string; retryable: boolean;
+  storageStage?: string; storageCategory?: string; storageRetryable?: boolean;
   operation?: MetadataOperation; attempt?: number;
 } {
-  if (error instanceof CheckpointQueueError) return { code: null, stage: 'checkpoint', category: error.category, retryable: false };
+  if (error instanceof CheckpointQueueError) return { code: error.storage?.httpStatus ?? null, stage: 'checkpoint',
+    category: error.category, retryable: false,
+    ...(error.storage ? { storageStage: error.storage.storageStage, storageCategory: error.storage.storageCategory,
+      storageRetryable: error.storage.retryable } : {}) };
   if (error instanceof Error && /^Recording exceeds maxBytes=\d+$/.test(error.message)) {
     return { code: null, stage, category: 'CAPACITY_EXHAUSTED', retryable: false };
   }
@@ -108,6 +112,14 @@ function writeJson(file: string, value: unknown): void {
   renameSync(temporary, file);
 }
 
+export function recorderCodeHashes(root: string): Record<string, string> {
+  const files = ['src/report/record-market.ts', 'src/report/metadata-retry.ts', 'src/research/market-recorder.ts', 'src/research/market-recording.ts',
+    'src/research/capture-timing.ts',
+    'src/research/market-observation.ts', 'src/research/checkpoint-queue.ts', 'src/research/market-recording-report.ts', 'src/research/order-book-costs.ts',
+    'src/research/observation-session.ts', 'src/core/tinkoff-client.ts', 'certs/russian-trusted-root-ca.pem', 'package-lock.json'];
+  return Object.fromEntries(files.map(file => [file, createHash('sha256').update(readFileSync(path.join(root, file))).digest('hex')]));
+}
+
 export async function recordMarket(args: RecorderArguments, root: string): Promise<string> {
   if (args.onCheckpoint && args.checkpointIntervalMs === undefined && args.segmentMaxBytes === undefined) {
     throw new Error('Checkpoint capture requires temporal or size segmentation');
@@ -121,10 +133,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
   const runId = randomUUID();
   const directory = path.join(args.outputDir, `${new Date().toISOString().replaceAll(':', '-')}-${runId.slice(0, 8)}`);
   mkdirSync(args.outputDir, { recursive: true }); mkdirSync(directory, { mode: 0o700 });
-  const files = ['src/report/record-market.ts', 'src/report/metadata-retry.ts', 'src/research/market-recorder.ts', 'src/research/market-recording.ts',
-    'src/research/market-observation.ts', 'src/research/checkpoint-queue.ts', 'src/research/market-recording-report.ts', 'src/research/order-book-costs.ts',
-    'src/research/observation-session.ts', 'src/core/tinkoff-client.ts', 'certs/russian-trusted-root-ca.pem', 'package-lock.json'];
-  const codeHashes = Object.fromEntries(files.map(file => [file, createHash('sha256').update(readFileSync(path.join(root, file))).digest('hex')]));
+  const codeHashes = recorderCodeHashes(root);
   const manifest: ObservationManifest = {
     schemaVersion: 1, runId, createdAt: new Date().toISOString(), status: 'PREPARING', endpoint: options.endpoint,
     source: args.source, instruments: [], intervals: [], scheduleFetchedAt: null, codeHashes,
@@ -140,6 +149,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
       'Only API-provided schedule intervals are classified. No hard-coded historical main-session start.',
       'Repeated trade observations are retained because the SDK trade has no unique trade ID.',
       'This finite run does not schedule future collection or start any trading strategy.',
+      'Capture timing begins after the SDK iterator yields a decoded object. Append return follows writeSync with periodic fsync; timing cannot identify socket, provider, network or exchange latency.',
     ],
   };
   if (args.checkpointIntervalMs !== undefined) manifest.notes.push(`Closed immutable checkpoint interval: ${args.checkpointIntervalMs}ms; one continuous run.`);
@@ -236,6 +246,7 @@ export async function recordMarket(args: RecorderArguments, root: string): Promi
         } else activeWriter.append(kind, payload, epoch);
       },
       expectedSubscriptions: observationSubscriptions(manifest.instruments),
+      timingInstrumentUids: manifest.instruments.map(i => i.uid),
       acknowledgments: payload => subscriptionAcknowledgments(payload, args.source, args.depth),
       durationMs: manifest.settings.durationMs, subscriptionTimeoutMs: manifest.settings.subscriptionTimeoutMs,
       heartbeatTimeoutMs: manifest.settings.heartbeatTimeoutMs, tickIntervalMs: manifest.settings.sampleIntervalMs,

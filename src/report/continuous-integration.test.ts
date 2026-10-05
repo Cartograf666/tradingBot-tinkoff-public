@@ -26,7 +26,7 @@ test('two scientific references restore one verified raw run, without duplicate 
     const archive = path.join(root, name);
     execFileSync('tar', ['-czf', archive, '-C', root, path.basename(directory)]);
     const bytes = readFileSync(archive);
-    return { id, name, size: bytes.length, digest: `sha256:${sha(bytes)}`, archive };
+    return { id, name, size: bytes.length, state: 'uploaded', digest: `sha256:${sha(bytes)}`, archive };
   };
   const sourceAsset = makeAsset(raw, 'continuous-block-one.tar.gz', 100);
   const source = { assetId: 100, assetName: sourceAsset.name, assetBytes: sourceAsset.size,
@@ -117,18 +117,22 @@ test('report recovery retries a partial raw block, commits every window, marks c
     captureFormat: 'continuous-v2', checkpointIntervalMs: 300_000, recordingStoppedAt: iso(20_000), parts: [] };
   const fixture = path.join(root, 'fixture.json'), log = path.join(root, 'actions.log');
   const encode = (value: unknown) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`).toString('base64');
-  writeFileSync(fixture, JSON.stringify({ root, nextId: 101, failPattern: '-02-', failCount: 3, log,
-    assets: [{ id: 100, name: path.basename(rawArchive), size: rawBytes.length, digest: `sha256:${sha(rawBytes)}`, archive: storedRaw }],
+  const fullBase = Array.from({ length: 1000 }, (_, index) => ({ id: 1001 + index,
+    name: `historical-${index}.tar.gz`, size: index === 0 ? 0 : 1,
+    state: index === 0 ? 'starter' : 'uploaded', digest: `sha256:${'b'.repeat(64)}`, releaseId: 9 }));
+  writeFileSync(fixture, JSON.stringify({ root, nextId: 2001, failPattern: '-02-', failCount: 3, log,
+    assets: [...fullBase, { id: 100, name: path.basename(rawArchive), size: rawBytes.length,
+      state: 'uploaded', digest: `sha256:${sha(rawBytes)}`, archive: storedRaw, releaseId: 10 }],
     files: { 'study-ledger.json': { content: encode(ledger), sha: 'sha-ledger-0' },
       'operations/900-1.json': { content: encode(operation), sha: 'sha-operation-0' } } }));
   const bin = path.join(root, 'bin'); mkdirSync(bin); const shim = path.join(bin, 'gh');
   writeFileSync(shim, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 const file=process.env.CONTINUOUS_TEST_FIXTURE;let f=JSON.parse(fs.readFileSync(file));const a=process.argv.slice(2);const save=()=>fs.writeFileSync(file,JSON.stringify(f));const endpoint=a.find(x=>x.startsWith('/repos/'))||'';
 const fail=(n)=>{process.stderr.write('gh: failure (HTTP '+n+')');process.exit(1)};
-if(a[0]==='release'&&a[1]==='upload'){const src=a[3],name=path.basename(src);if(f.failCount>0&&name.includes(f.failPattern)){f.failCount--;fs.appendFileSync(f.log,'FAIL '+name+'\\n');save();process.exit(1)}const dst=path.join(f.root,'assets',name);fs.copyFileSync(src,dst);const b=fs.readFileSync(dst),id=f.nextId++;f.assets.push({id,name,size:b.length,digest:'sha256:'+crypto.createHash('sha256').update(b).digest('hex'),archive:dst});fs.appendFileSync(f.log,'UPLOAD '+name+'\\n');save();process.exit(0)}
+if(a[0]==='release'&&a[1]==='upload'){const src=a[3],name=path.basename(src),releaseId=a[2]==='${STUDY_RELEASE_TAG}-part-0002'?10:9;if(f.failCount>0&&name.includes(f.failPattern)){f.failCount--;fs.appendFileSync(f.log,'FAIL '+name+'\\n');save();fail(503)}const dst=path.join(f.root,'assets',name);fs.copyFileSync(src,dst);const b=fs.readFileSync(dst),id=f.nextId++;f.assets.push({id,name,size:b.length,state:'uploaded',digest:'sha256:'+crypto.createHash('sha256').update(b).digest('hex'),archive:dst,releaseId});fs.appendFileSync(f.log,'UPLOAD '+name+'\\n');save();process.exit(0)}
 if(a.includes('Accept: application/octet-stream')){const id=Number(endpoint.split('/').at(-1)),asset=f.assets.find(x=>x.id===id);if(!asset)fail(404);process.stdout.write(fs.readFileSync(asset.archive));process.exit(0)}
-if(/\\/releases\\?/.test(endpoint)){process.stdout.write(JSON.stringify([{id:9,draft:true,tag_name:'${STUDY_RELEASE_TAG}'}]));process.exit(0)}
-if(/\\/releases\\/9\\/assets\\?/.test(endpoint)){process.stdout.write(JSON.stringify(f.assets.map(({archive,...x})=>x)));process.exit(0)}
+if(/\\/releases\\?/.test(endpoint)){process.stdout.write(JSON.stringify([{id:9,draft:true,tag_name:'${STUDY_RELEASE_TAG}'},{id:10,draft:true,tag_name:'${STUDY_RELEASE_TAG}-part-0002'}]));process.exit(0)}
+if(/\\/releases\\/(9|10)\\/assets\\?/.test(endpoint)){const id=Number(endpoint.split('/')[5]),page=Number(new URL('https://example.test'+endpoint).searchParams.get('page'))||1;process.stdout.write(JSON.stringify(f.assets.filter(x=>x.releaseId===id).slice((page-1)*100,page*100).map(({archive,releaseId,...x})=>x)));process.exit(0)}
 if(endpoint==='/repos/owner/private'){process.stdout.write(JSON.stringify({private:true,default_branch:'main'}));process.exit(0)}
 if(/\\/git\\/ref\\/heads\\/(observation-state|main)$/.test(endpoint)){process.stdout.write(JSON.stringify({object:{sha:'base'}}));process.exit(0)}
 const m=/\\/contents\\/(.+?)(?:\\?ref=.*)?$/.exec(endpoint);if(m){const key=m[1];if(a.includes('PUT')){const input=a[a.indexOf('--input')+1],p=JSON.parse(fs.readFileSync(input));const old=f.files[key];if((old&&p.sha!==old.sha)||(!old&&p.sha))fail(409);const sha='sha-'+(++f.nextId);f.files[key]={content:p.content,sha};fs.appendFileSync(f.log,'PUT '+key+'\\n');save();process.stdout.write('{}');process.exit(0)}const v=f.files[key];if(!v)fail(404);process.stdout.write(JSON.stringify(v));process.exit(0)}
@@ -145,6 +149,10 @@ fail(404);\n`);
   assert.equal(await reconcileContinuousBlocks('owner/private', workspace2), 0);
   state = JSON.parse(readFileSync(fixture, 'utf8')); assert.ok(state.files['continuous-completed/100.json']);
   ledger = JSON.parse(Buffer.from(state.files['study-ledger.json'].content, 'base64').toString()); assert.equal(ledger.chunks.length, 2);
+  assert.equal(state.assets.filter((item: { releaseId: number }) => item.releaseId === 9).length, 1000);
+  assert.equal(state.assets.find((item: { id: number }) => item.id === 100).releaseId, 10);
+  assert.ok(state.assets.filter((item: { name: string }) => item.name.startsWith('study-'))
+    .every((item: { releaseId: number }) => item.releaseId === 10));
   const savedOperation = JSON.parse(Buffer.from(state.files['operations/900-1.json'].content, 'base64').toString());
   assert.equal(savedOperation.state, 'FINISHED'); assert.equal(savedOperation.parts.length, 2);
   const actionsBefore = readFileSync(log, 'utf8');

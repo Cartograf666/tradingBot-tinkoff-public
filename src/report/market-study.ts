@@ -9,22 +9,26 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TinkoffInvestApi } from 'tinkoff-invest-api';
 import { TINKOFF_SANDBOX_ENDPOINT } from '../core/tinkoff-client.js';
-import { confirmImmutableAsset } from './immutable-asset.js';
+import { confirmFamilyAsset, familyInventory, parsePhysicalReleases, type PhysicalRelease, type ReleaseFamilyIO } from './release-family.js';
+import { CheckpointStorageFailure, checkpointStorageStep } from './checkpoint-diagnostic.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
 import { closedPlansNeedingFinalization, confirmOperationCheckpoint, continuousOperationFailureStage, continuousRecordingCompleted, markOperationRecordingStopped,
   mergeBlockOperations, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
 import { readStudyRuntime } from './study-runtime.js';
 import { fixedReplayScenarios, replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
+import { checkRecordedReplayCompatibility } from './replay-compatibility.js';
 import { buildDailyResearchReport, dailyResearchIdentity, renderDailyResearchReport, selectDailyResearchInputs } from './daily-research.js';
+import { selectStudyDayInputs, studyDayInputHash } from '../research/study-day-inputs.js';
 import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
 import {
-  STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
-  acceptStudyChunk, acceptStudyDay, beginStudyAttempt, createStudyLedger, freezeStudy, mergeStudyLedgers, planStudyRun,
+  acceptStudyChunk, acceptStudyDay, assertStudyLedgerProtocol, beginStudyAttempt, createStudyLedger, freezeStudy,
+  mergeStudyLedgers, migrateStudyAttemptBudget, planStudyRun, StaleStudyDayInputError,
   type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger,
 } from '../research/study-state.js';
 
@@ -94,9 +98,9 @@ export async function ensureStateBranch(repository: string, request: (args: stri
     await request(['api', `/repos/${repository}/git/ref/heads/${STUDY_STATE_BRANCH}`]);
   }
 }
-async function readRemoteFile<T>(repository: string, file: string): Promise<RemoteFile<T>> {
+async function readRemoteFile<T>(repository: string, file: string, signal?: AbortSignal): Promise<RemoteFile<T>> {
   try {
-    const response = await ghJson(['api', `/repos/${repository}/contents/${file}?ref=observation-state`]);
+    const response = await ghJson(['api', `/repos/${repository}/contents/${file}?ref=observation-state`], signal);
     if (typeof response.content !== 'string' || typeof response.sha !== 'string') throw new Error('Invalid GitHub state response');
     return { value: JSON.parse(Buffer.from(response.content.replaceAll('\n', ''), 'base64').toString('utf8')) as T, sha: response.sha };
   } catch (error) {
@@ -104,9 +108,9 @@ async function readRemoteFile<T>(repository: string, file: string): Promise<Remo
     throw error;
   }
 }
-async function readRemoteText(repository: string, file: string): Promise<RemoteFile<string>> {
+async function readRemoteText(repository: string, file: string, signal?: AbortSignal): Promise<RemoteFile<string>> {
   try {
-    const response = await ghJson(['api', `/repos/${repository}/contents/${file}?ref=observation-state`]);
+    const response = await ghJson(['api', `/repos/${repository}/contents/${file}?ref=observation-state`], signal);
     if (typeof response.content !== 'string' || typeof response.sha !== 'string') throw new Error('Invalid GitHub text response');
     return { value: Buffer.from(response.content.replaceAll('\n', ''), 'base64').toString('utf8'), sha: response.sha };
   } catch (error) {
@@ -114,10 +118,11 @@ async function readRemoteText(repository: string, file: string): Promise<RemoteF
     throw error;
   }
 }
-async function putRemoteFile(repository: string, file: string, content: string, sha: string | null, message: string): Promise<void> {
+async function putRemoteFile(repository: string, file: string, content: string, sha: string | null, message: string,
+  signal?: AbortSignal): Promise<void> {
   const payload = path.join(tmpdir(), `market-study-put-${randomUUID()}.json`);
   atomicJson(payload, { message, content: Buffer.from(content).toString('base64'), branch: 'observation-state', ...(sha ? { sha } : {}) });
-  try { await ghJson(['api', '--method', 'PUT', `/repos/${repository}/contents/${file}`, '--input', payload]); }
+  try { await ghJson(['api', '--method', 'PUT', `/repos/${repository}/contents/${file}`, '--input', payload], signal); }
   finally { unlinkSync(payload); }
 }
 export function ledgerReadme(ledger: StudyLedger, repository: string): string {
@@ -139,20 +144,47 @@ export function ledgerReadme(ledger: StudyLedger, repository: string): string {
   }
   const rows = [...aggregates.values()].map(item => `| ${item.phase} | ${item.scenario} | ${item.days} | ${item.entries} | ${item.netKnown ? item.net.toFixed(2) : '—'} | ${item.fees.toFixed(2)} | ${item.unresolved} |`).join('\n');
   const table = rows ? `\n| Phase | Scenario | Days | Entries | Net PnL, RUB | Fees, RUB | Unresolved |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n${rows}\n` : '';
-  return `# Market study state\n\n- Phase: **${ledger.phase}**\n- Protocol: \`${ledger.protocolHash}\`\n- Development days: ${development.size}/10\n- Holdout days: ${holdout.size}/10\n- Rejected finalized days: ${rejected}\n- Attempts: ${ledger.attempts.length}/60\n- Confirmed immutable chunks: ${ledger.chunks.length}\n- Archive: [private draft release](https://github.com/${repository}/releases/tag/${STUDY_RELEASE_TAG})\n- Updated: ${ledger.updatedAt}\n${table}\nQuality acceptance is independent of replay PnL. The table includes passing days only, is descriptive, and never selects a winner. Raw recordings are release assets, never Git blobs.\n`;
+  return `# Market study state\n\n- Phase: **${ledger.phase}**\n- Protocol: \`${ledger.protocolHash}\`\n- Development days: ${development.size}/10\n- Holdout days: ${holdout.size}/10\n- Rejected finalized days: ${rejected}\n- Attempts: ${ledger.attempts.length}/${STUDY_MAX_ATTEMPTS}\n- Confirmed immutable chunks: ${ledger.chunks.length}\n- Archive: [private draft release](https://github.com/${repository}/releases/tag/${STUDY_RELEASE_TAG})\n- Updated: ${ledger.updatedAt}\n${table}\nQuality acceptance is independent of replay PnL. The table includes passing days only, is descriptive, and never selects a winner. Raw recordings are release assets, never Git blobs.\n`;
+}
+/** One compare-and-swap commit keeps the receipt and ledger transition indivisible. */
+export async function migrateRemoteStudyAttemptBudget(repository: string, signal?: AbortSignal): Promise<StudyLedger> {
+  await ensureStateBranch(repository);
+  for (let retry = 0; retry < 5; retry += 1) {
+    signal?.throwIfAborted();
+    const remote = await readRemoteFile<StudyLedger>(repository, STATE_PATH, signal);
+    const next = migrateStudyAttemptBudget(remote.value, new Date().toISOString());
+    if (remote.value.protocolHash === STUDY_PROTOCOL_HASH) return next;
+    try {
+      await putRemoteFile(repository, STATE_PATH, `${JSON.stringify(next, null, 2)}\n`, remote.sha,
+        'Migrate market study attempt budget from 60 to 100', signal);
+      try {
+        const readme = await readRemoteText(repository, README_PATH);
+        await putRemoteFile(repository, README_PATH, ledgerReadme(next, repository), readme.sha, 'Update market study status');
+      } catch { /* The ledger and migration receipt are authoritative. */ }
+      return next;
+    } catch (error) {
+      if (![409, 422].includes(ghErrorStatus(error) ?? 0)) throw error;
+      if (retry === 4) throw new Error('Study migration optimistic update failed after retries');
+    }
+  }
+  throw new Error('Study migration failed');
 }
 export async function updateRemoteLedger(
   repository: string,
   mutate: (ledger: StudyLedger) => StudyLedger,
   message: string,
+  options: { signal?: AbortSignal; validateCurrent?: (ledger: StudyLedger) => void } = {},
 ): Promise<StudyLedger> {
   await ensureStateBranch(repository);
   let desired: StudyLedger | null = null;
   for (let retry = 0; retry < 5; retry += 1) {
-    const remote = await readRemoteFile<StudyLedger>(repository, STATE_PATH);
+    options.signal?.throwIfAborted();
+    const remote = await readRemoteFile<StudyLedger>(repository, STATE_PATH, options.signal);
+    options.signal?.throwIfAborted();
+    options.validateCurrent?.(remote.value);
     desired = desired ? mergeStudyLedgers(remote.value, desired) : mutate(remote.value);
     try {
-      await putRemoteFile(repository, STATE_PATH, `${JSON.stringify(desired, null, 2)}\n`, remote.sha, message);
+      await putRemoteFile(repository, STATE_PATH, `${JSON.stringify(desired, null, 2)}\n`, remote.sha, message, options.signal);
       try {
         const readme = await readRemoteText(repository, README_PATH);
         await putRemoteFile(repository, README_PATH, ledgerReadme(desired, repository), readme.sha, 'Update market study status');
@@ -334,8 +366,8 @@ function recorderArguments(outputDir: string, seconds: number, session: 'main' |
     commissionRate: 0.0005, outputDir, maxBytes: 256 * 1024 * 1024,
     segmentMaxBytes: 32 * 1024 * 1024, session };
 }
-async function ensurePrivateRepository(repository: string): Promise<void> {
-  const repo = await ghJson(['api', `/repos/${repository}`]);
+async function ensurePrivateRepository(repository: string, signal?: AbortSignal): Promise<void> {
+  const repo = await ghJson(['api', `/repos/${repository}`], signal);
   if (repo.private !== true) throw new Error('Market-study raw data requires a private GitHub repository');
 }
 /** The by-tag endpoint excludes drafts. List authenticated releases instead. */
@@ -357,37 +389,63 @@ export async function findDraftRelease(repository: string,
   }
   throw new Error('Repository release inventory exceeds the supported limit');
 }
-async function ensureDraftRelease(repository: string): Promise<void> {
-  await ensurePrivateRepository(repository);
-  if (await findDraftRelease(repository)) return;
+async function ensureDraftRelease(repository: string, signal?: AbortSignal): Promise<void> {
+  const find = () => checkpointStorageStep('RELEASE_DISCOVERY',
+    async () => (await listReleaseFamily(repository, signal)).find(release => release.ordinal === 1), signal);
+  await checkpointStorageStep('RELEASE_DISCOVERY', () => ensurePrivateRepository(repository, signal), signal);
+  if (await find()) return;
   try {
-    await runFile('gh', ['release', 'create', STUDY_RELEASE_TAG, '--repo', repository, '--draft',
-      '--title', 'Market study immutable archive', '--notes', 'Private draft release for read-only market-study chunks.']);
+    await checkpointStorageStep('RELEASE_CREATE', () => runFile('gh', ['release', 'create', STUDY_RELEASE_TAG, '--repo', repository, '--draft',
+      '--title', 'Market study immutable archive', '--notes', 'Private draft release for read-only market-study chunks.'], { signal }), signal);
   } catch (createError) {
-    if (!await findDraftRelease(repository)) throw createError;
+    if (!await find()) throw createError;
   }
-  if (!await findDraftRelease(repository)) throw new Error('Created archive draft was not confirmed');
+  if (!await find()) throw new CheckpointStorageFailure({ storageStage: 'RELEASE_DISCOVERY',
+    storageCategory: 'REMOTE_INVALID', httpStatus: null, retryable: false });
 }
-interface ReleaseAsset { id: number; name: string; size: number; digest?: string }
-async function releaseAssets(repository: string, signal?: AbortSignal): Promise<ReleaseAsset[]> {
-  const release = await findDraftRelease(repository);
-  if (!release) throw new Error('Archive draft is missing from the release inventory');
-  const result: ReleaseAsset[] = [];
-  for (let page = 1; page <= 200; page += 1) {
+interface ReleaseAsset { id: number; name: string; size: number; state: 'uploaded' | 'starter'; digest?: string }
+export async function listReleaseFamily(repository: string, signal?: AbortSignal,
+  request: (args: string[], signal?: AbortSignal) => Promise<unknown> = ghJson): Promise<PhysicalRelease[]> {
+  const raw: unknown[] = [];
+  for (let page = 1; page <= 10; page += 1) {
     signal?.throwIfAborted();
-    const response = await ghJson(['api', `/repos/${repository}/releases/${Number(release.id)}/assets?per_page=100&page=${page}`], signal);
+    const releases = await request(['api', `/repos/${repository}/releases?per_page=100&page=${page}`], signal);
+    if (!Array.isArray(releases)) throw new Error('Invalid release inventory');
+    raw.push(...releases);
+    if (releases.length < 100) return parsePhysicalReleases(raw);
+  }
+  throw new Error('Repository release inventory exceeds the supported limit');
+}
+export async function releaseAssetsIn(repository: string, release: PhysicalRelease, signal?: AbortSignal,
+  request: (args: string[], signal?: AbortSignal) => Promise<unknown> = ghJson): Promise<ReleaseAsset[]> {
+  const result: ReleaseAsset[] = [];
+  for (let page = 1; page <= 11; page += 1) {
+    signal?.throwIfAborted();
+    const response = await request(['api', `/repos/${repository}/releases/${Number(release.id)}/assets?per_page=100&page=${page}`], signal);
     if (!Array.isArray(response)) throw new Error('Invalid release asset page');
     for (const raw of response as JsonObject[]) {
-      const asset = { id: Number(raw.id), name: String(raw.name), size: Number(raw.size),
+      const asset = { id: Number(raw.id), name: raw.name, size: Number(raw.size), state: raw.state,
         digest: typeof raw.digest === 'string' ? raw.digest : undefined };
-      if (!Number.isSafeInteger(asset.id) || asset.id <= 0 || !asset.name || !Number.isSafeInteger(asset.size) || asset.size <= 0) {
+      if (!Number.isSafeInteger(asset.id) || asset.id <= 0 || typeof asset.name !== 'string' || !asset.name
+        || !Number.isSafeInteger(asset.size) || asset.size < 0
+        || !['uploaded', 'starter'].includes(asset.state as string)
+        || (asset.digest && !/^sha256:[a-f0-9]{64}$/.test(asset.digest))) {
         throw new Error('Invalid release asset metadata');
       }
-      result.push(asset);
+      result.push(asset as ReleaseAsset);
     }
+    if (result.length > 1000) throw new Error('Release asset capacity exceeded');
     if (response.length < 100) return result;
   }
-  throw new Error('Draft release reached its supported 20000-asset inventory');
+  throw new Error('Release asset capacity exceeded');
+}
+async function releaseAssets(repository: string, signal?: AbortSignal): Promise<ReleaseAsset[]> {
+  const inventory = await familyInventory({
+    releases: () => listReleaseFamily(repository, signal),
+    assets: release => releaseAssetsIn(repository, release, signal),
+  }, signal);
+  if (!inventory.releases.length) throw new Error('Archive draft is missing from the release inventory');
+  return inventory.assets;
 }
 async function downloadAsset(repository: string, assetId: number, destination: string, signal?: AbortSignal): Promise<void> {
   const { stdout } = await runFile('gh', ['api', '-H', 'Accept: application/octet-stream',
@@ -396,16 +454,24 @@ async function downloadAsset(repository: string, assetId: number, destination: s
 }
 async function uploadConfirmedAsset(repository: string, archive: string, signal?: AbortSignal): Promise<ReleaseAsset> {
   signal?.throwIfAborted();
-  await ensureDraftRelease(repository);
-  return confirmImmutableAsset({ name: path.basename(archive), bytes: statSync(archive).size, sha256: sha256File(archive) }, {
-    find: async () => (await releaseAssets(repository, signal)).find(item => item.name === path.basename(archive)),
-    upload: async () => { await runFile('gh', ['release', 'upload', STUDY_RELEASE_TAG, archive, '--repo', repository], { signal }); },
+  await ensureDraftRelease(repository, signal);
+  const io: ReleaseFamilyIO = {
+    releases: () => checkpointStorageStep('RELEASE_DISCOVERY', () => listReleaseFamily(repository, signal), signal),
+    assets: release => checkpointStorageStep('ASSET_INVENTORY', () => releaseAssetsIn(repository, release, signal), signal),
+    create: tag => checkpointStorageStep('RELEASE_CREATE', () => runFile('gh', ['release', 'create', tag,
+      '--repo', repository, '--draft', '--title', `Market study immutable archive ${tag}`,
+      '--notes', 'Private draft release for read-only market-study chunks.'], { signal }), signal).then(() => undefined),
+    upload: release => checkpointStorageStep('ASSET_UPLOAD',
+      () => runFile('gh', ['release', 'upload', release.tag, archive, '--repo', repository], { signal }), signal).then(() => undefined),
     downloadedHash: async asset => {
       const downloaded = path.join(tmpdir(), `market-study-verify-${randomUUID()}.tar.gz`);
-      try { await downloadAsset(repository, asset.id, downloaded, signal); return sha256File(downloaded); }
+      try { return await checkpointStorageStep('ASSET_VERIFY', async () => {
+        await downloadAsset(repository, asset.id, downloaded, signal); return sha256File(downloaded);
+      }, signal); }
       finally { rmSync(downloaded, { force: true }); }
     },
-  }, signal);
+  };
+  return confirmFamilyAsset({ name: path.basename(archive), bytes: statSync(archive).size, sha256: sha256File(archive) }, io, signal);
 }
 
 interface ChunkDraft extends Omit<StudyChunkReceipt, 'assetId' | 'assetDigest' | 'assetBytes' | 'archiveSha256'> {
@@ -494,40 +560,40 @@ async function inspectArchive(archive: string): Promise<{ entries: string[]; rec
   if (receipts.length !== 1) throw new Error('Release archive must contain one study receipt');
   return { entries, receiptEntry: receipts[0], kind: receipts[0].endsWith('/study-day-receipt.json') ? 'day' : 'chunk' };
 }
-function validatedRecoveredDay(raw: unknown, asset: ReleaseAsset, archiveSha256: string, ledger: StudyLedger): StudyDayReceipt {
+function recoveredDayReceipt(raw: unknown, asset: ReleaseAsset, archiveSha256: string): StudyDayReceipt {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Day report receipt is invalid');
   const draft = raw as Record<string, unknown>;
   if (['reportAssetId', 'reportAssetDigest', 'reportAssetBytes', 'reportArchiveSha256'].some(key => key in draft)) {
     throw new Error('Day draft contains mutable remote identity');
   }
-  const receipt = { ...draft, reportAssetId: asset.id, reportAssetName: asset.name,
+  return { ...draft, reportAssetId: asset.id, reportAssetName: asset.name,
     reportAssetDigest: asset.digest ?? `sha256:${archiveSha256}`, reportAssetBytes: asset.size,
     reportArchiveSha256: archiveSha256 } as unknown as StudyDayReceipt;
-  acceptStudyDay(ledger, receipt);
-  return receipt;
 }
-function validatedRecoveredReceipt(raw: unknown, asset: ReleaseAsset, archiveSha256: string, ledger: StudyLedger): StudyChunkReceipt {
+function recoveredChunkReceipt(raw: unknown, asset: ReleaseAsset, archiveSha256: string): StudyChunkReceipt {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Release receipt is invalid');
   const draft = raw as Record<string, unknown>;
   if ('assetId' in draft || 'assetDigest' in draft || 'assetBytes' in draft || 'archiveSha256' in draft) {
     throw new Error('Draft receipt contains mutable remote identity');
   }
-  const receipt = { ...draft, assetId: asset.id, assetName: asset.name,
+  return { ...draft, assetId: asset.id, assetName: asset.name,
     assetDigest: asset.digest ?? `sha256:${archiveSha256}`, assetBytes: asset.size,
     archiveSha256 } as unknown as StudyChunkReceipt;
-  // This is validation as well as a recovery dry-run; only the returned ledger is discarded.
-  acceptStudyChunk(ledger, receipt);
-  return receipt;
 }
 
 /** Recover a confirmed upload whose previous job died before its optimistic ledger commit. */
 export async function reconcileReleaseAssets(repository: string): Promise<StudyLedger> {
   await ensurePrivateRepository(repository);
   const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+  assertStudyLedgerProtocol(ledger);
   const known = new Set([...ledger.chunks.map(chunk => chunk.assetId), ...ledger.days.map(day => day.reportAssetId)]);
   const candidates = (await releaseAssets(repository)).filter(asset => /^(?:study-\d{4}-\d{2}-\d{2}-(?:early|late)-|study-day-)/.test(asset.name) && !known.has(asset.id));
-  let current = ledger;
+  const pendingChunks = new Map<number, StudyChunkReceipt>();
+  const pendingDays: StudyDayReceipt[] = [];
+  let incompleteAssets = 0;
+  let retiredProtocolAssets = 0;
   for (const asset of candidates.sort((a, b) => a.id - b.id)) {
+    if (asset.state === 'starter') { incompleteAssets++; continue; }
     const temporary = mkdtempSync(path.join(tmpdir(), 'market-study-reconcile-'));
     const archive = path.join(temporary, asset.name);
     try {
@@ -538,21 +604,57 @@ export async function reconcileReleaseAssets(repository: string): Promise<StudyL
       const { receiptEntry, kind } = await inspectArchive(archive);
       const receiptBytes = await runFile('tar', ['-xOzf', archive, receiptEntry], { maxBuffer: 1024 * 1024 });
       const raw = JSON.parse(receiptBytes.stdout.toString('utf8'));
-      if (kind === 'chunk') {
-        const receipt = validatedRecoveredReceipt(raw, asset, archiveHash, current);
-        current = await updateRemoteLedger(repository, state => acceptStudyChunk(state, receipt), `Recover ${receipt.chunkId}`);
-      } else {
-        const receipt = validatedRecoveredDay(raw, asset, archiveHash, current);
-        current = await updateRemoteLedger(repository, state => acceptStudyDay(state, receipt), `Recover ${receipt.sessionDate} report`);
+      const receipt = kind === 'chunk' ? recoveredChunkReceipt(raw, asset, archiveHash)
+        : recoveredDayReceipt(raw, asset, archiveHash);
+      if (receipt.protocolHash === STUDY_60_ATTEMPT_PROTOCOL_HASH && ledger.attemptBudgetMigration) {
+        retiredProtocolAssets++;
+        continue; // A pre-migration upload is archived evidence, never a new ledger input.
       }
+      if (receipt.protocolHash !== STUDY_PROTOCOL_HASH) throw new Error('Release receipt protocol mismatch');
+      if (kind === 'chunk') pendingChunks.set(asset.id, receipt as StudyChunkReceipt);
+      else pendingDays.push(receipt as StudyDayReceipt);
     } finally { rmSync(temporary, { recursive: true, force: true }); }
+  }
+  if (incompleteAssets) appendStudySummary(`Пропущено незавершённых приватных архивов: ${incompleteAssets}. Они не засчитаны как научные данные.`);
+  if (retiredProtocolAssets) appendStudySummary(`Отложено архивов со старым протоколом: ${retiredProtocolAssets}. Они не добавлены в ledger после миграции; архивы сохранены для отдельного аудита.`);
+  let current = ledger;
+  // Confirmed chunks are recovered before reports. A quality-passing retry
+  // discovered after an interrupted commit must participate in the same
+  // deterministic selection as one that committed before report recovery.
+  for (const [assetId, chunk] of [...pendingChunks].sort(([a], [b]) => a - b)) {
+    current = await updateRemoteLedger(repository, state => acceptStudyChunk(state, chunk), `Recover ${chunk.chunkId}`);
+  }
+  for (const day of pendingDays.sort((a, b) => a.reportAssetId - b.reportAssetId)) {
+    if (current.days.some(item => item.sessionDate === day.sessionDate)) {
+      try { acceptStudyDay(current, day); }
+      catch (error) { if (!(error instanceof Error) || error.message !== 'Finalized study day changed') throw error; }
+      appendStudySummary(`Дополнительный архив отчёта за ${day.sessionDate} сохранён приватно; научный день уже закреплён.`);
+      continue;
+    }
+    try {
+      current = await updateRemoteLedger(repository, state => acceptStudyDay(state, day), `Recover ${day.sessionDate} report`);
+    } catch (error) {
+      if (error instanceof StaleStudyDayInputError) {
+        appendStudySummary(`Устаревший архив отчёта за ${day.sessionDate} сохранён приватно; полный день будет пересчитан по неизменным архивам.`);
+        continue;
+      }
+      // A competing writer may have finalized the date during optimistic retry.
+      const latest = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
+      if (!latest.days.some(item => item.sessionDate === day.sessionDate)) throw error;
+      try { acceptStudyDay(latest, day); }
+      catch (validation) { if (!(validation instanceof Error) || validation.message !== 'Finalized study day changed') throw validation; }
+      current = latest;
+      appendStudySummary(`Дополнительный архив отчёта за ${day.sessionDate} сохранён приватно; научный день уже закреплён.`);
+    }
   }
   return current;
 }
 
 export async function materializeAsset(repository: string, receipt: StudyChunkReceipt, workspace: string): Promise<string> {
   const asset = (await releaseAssets(repository)).find(item => item.id === receipt.assetId);
-  if (!asset || asset.name !== receipt.assetName || asset.size !== receipt.assetBytes) throw new Error('Canonical release asset metadata changed');
+  if (!asset || asset.state !== 'uploaded' || asset.name !== receipt.assetName || asset.size !== receipt.assetBytes) {
+    throw new Error('Canonical release asset metadata changed');
+  }
   const archive = path.join(workspace, asset.name);
   await downloadAsset(repository, asset.id, archive);
   if (sha256File(archive) !== receipt.archiveSha256) throw new Error('Canonical release asset content changed');
@@ -593,41 +695,31 @@ export async function materializeStudyInputs(repository: string, receipts: Study
   return directories;
 }
 
-function expectedChunkIds(plan: StudyBlockPlan): string[] {
-  const earlyAt = Date.parse(`${plan.sessionDate}T05:50:00.000Z`);
-  const lateAt = Date.parse(`${plan.sessionDate}T10:50:00.000Z`);
-  const early = planStudyBlock(plan.sessionDate, plan.mainStart, plan.mainEnd, 'early', earlyAt);
-  const late = planStudyBlock(plan.sessionDate, plan.mainStart, plan.mainEnd, 'late', lateAt);
-  if (!early || !late) throw new Error('Full study day does not contain both configured blocks');
-  return [...early.chunks.map(chunk => `${plan.sessionDate}:early:${chunk.index}`),
-    ...late.chunks.map(chunk => `${plan.sessionDate}:late:${chunk.index}`)];
-}
-
-/** Finalize only an exact, immutable canonical set for the complete API session. */
+/** Finalize the complete immutable receipt set; the replay independently applies
+ * the full API-session quality gate to actual events, including every gap. */
 export async function maybeFinalizeStudyDay(repository: string, plan: StudyBlockPlan, workspace: string): Promise<string | null> {
   const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
-  assertFrozenRuntime(ledger);
-  const chunkIds = expectedChunkIds(plan), receipts: StudyChunkReceipt[] = [];
-  for (const chunkId of chunkIds) {
-    const assetId = ledger.canonicalChunks[chunkId];
-    const receipt = ledger.chunks.find(chunk => chunk.assetId === assetId);
-    if (!receipt) return null;
-    receipts.push(receipt);
-  }
-  const phases = new Set(receipts.map(receipt => receipt.phase));
-  if (phases.size !== 1) throw new Error('Canonical study day spans multiple phases');
-  const phase = receipts[0].phase;
+  const selection = selectStudyDayInputs(ledger, plan);
+  if (selection.receipts.length !== selection.expectedCount || !selection.phase) return null;
+  const { receipts, phase } = selection;
   const finalized = ledger.days.find(day => day.sessionDate === plan.sessionDate && day.phase === phase);
   if (finalized) return null;
-  const inputHash = hashStudyValue(receipts.map(receipt => ({ chunkId: receipt.chunkId, assetId: receipt.assetId,
-    archiveSha256: receipt.archiveSha256, recordingHash: receipt.recordingHash })));
+  const sourceHashes = replaySourceHashes(process.cwd());
+  const compatibility = checkRecordedReplayCompatibility(receipts, {
+    replayConfigHash: replayConfigHash(), simulatorHashes: sourceHashes,
+  });
+  if (compatibility.status === 'RECORDED_RUNTIME_REQUIRED') {
+    appendStudySummary(`Научный отчёт ${plan.sessionDate}: RECORDED_RUNTIME_REQUIRED (${compatibility.reasons.join(', ')}). Исторические архивы сохранены; текущая версия обработки не подходит.`);
+    return null;
+  }
+  assertFrozenRuntime(ledger);
+  const inputHash = studyDayInputHash(receipts);
   const materialized = mkdtempSync(path.join(path.resolve(workspace), `day-${plan.sessionDate}-`));
   const outputDirectory = path.join(materialized, 'replay');
   try {
     const directories = await materializeStudyInputs(repository, receipts, materialized);
     const report = await replaySession(directories, outputDirectory, { sessionDate: plan.sessionDate,
       mainStart: plan.mainStart, mainEnd: plan.mainEnd });
-    const sourceHashes = replaySourceHashes(process.cwd());
     if (report.configHash !== replayConfigHash() || !sameHashes(report.simulatorHashes, sourceHashes)) {
       throw new Error('Replay report source identity differs from the running implementation');
     }
@@ -694,15 +786,16 @@ function appendStudySummary(message: string): void {
   console.log(message);
   if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n\n`, { flag: 'a' });
 }
-async function saveOperation(repository: string, operation: BlockOperation): Promise<void> {
+async function saveOperation(repository: string, operation: BlockOperation, signal?: AbortSignal): Promise<void> {
   if (!/^\d+:\d+$/.test(operation.attemptId)) throw new Error('Invalid operational attempt identity');
   const file = `operations/${operation.attemptId.replace(':', '-')}.json`;
   operation.updatedAt = new Date().toISOString();
   for (let retry = 0; retry < 5; retry += 1) {
-    const remote = await readRemoteText(repository, file);
+    signal?.throwIfAborted();
+    const remote = await readRemoteText(repository, file, signal);
     const desired = remote.value ? mergeBlockOperations(JSON.parse(remote.value) as BlockOperation, operation) : structuredClone(operation);
     try {
-      await putRemoteFile(repository, file, `${JSON.stringify(desired, null, 2)}\n`, remote.sha, 'Update capture operational evidence');
+      await putRemoteFile(repository, file, `${JSON.stringify(desired, null, 2)}\n`, remote.sha, 'Update capture operational evidence', signal);
       Object.assign(operation, desired); return;
     } catch (error) {
       if (![409, 422].includes(ghErrorStatus(error) ?? 0)) throw error;
@@ -833,12 +926,19 @@ export async function refreshDailyResearchReports(repository: string): Promise<n
   const identity = { replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(),
     fixedScenarios: fixedReplayScenarios(), reportVersionHash: hashStudyValue({
       report: sha256File(path.resolve('src/report/daily-research.ts')),
+      selection: sha256File(path.resolve('src/research/study-day-inputs.ts')),
+      compatibility: sha256File(path.resolve('src/report/replay-compatibility.ts')),
       integration: sha256File(path.resolve('src/report/market-study.ts')),
     }) };
   let completed = 0, failures = 0;
   for (const plan of [...plans.values()].sort((a, b) => b.sessionDate.localeCompare(a.sessionDate))) {
     const selection = selectDailyResearchInputs(ledger, plan);
     if (selection.action !== 'closed') continue;
+    const compatibility = checkRecordedReplayCompatibility(selection.receipts, identity);
+    if (compatibility.status === 'RECORDED_RUNTIME_REQUIRED') {
+      appendStudySummary(`Диагностический анализ ${plan.sessionDate}: RECORDED_RUNTIME_REQUIRED (${compatibility.reasons.join(', ')}). Исторический отчёт сохранён без изменений.`);
+      continue;
+    }
     const key = dailyResearchIdentity(selection, identity);
     const base = `reports/research-${plan.sessionDate}-${key}`;
     const pointer = `reports/research-${plan.sessionDate}.json`;
@@ -1132,6 +1232,7 @@ function supportedContinuousPolicyHash(value: string): boolean {
   return value === CONTINUOUS_CAPTURE_POLICY_HASH || value === CONTINUOUS_CAPTURE_POLICY_V2_HASH;
 }
 function continuousAsset(asset: ReleaseAsset, archive: string): ContinuousAssetIdentity {
+  if (asset.state !== 'uploaded') throw new Error('Continuous asset is not uploaded');
   const archiveSha256 = sha256File(archive);
   return { assetId: asset.id, assetName: asset.name, assetBytes: asset.size,
     assetDigest: asset.digest ?? `sha256:${archiveSha256}`, archiveSha256 };
@@ -1184,10 +1285,11 @@ async function recordContinuousStudy(repository: string, workspace: string, args
     checkpointDrainTimeoutMs: continuousCapturePolicy.uploadDeadlineMs,
     onCheckpoint: async (checkpoint, signal) => {
       const checkpointDirectory = path.join(path.resolve(workspace), `checkpoint-${checkpoint.manifest.runId}-${checkpoint.segment.index}`);
-      const prepared = prepareContinuousCheckpoint(checkpoint.directory, checkpoint.segment,
-        { ...draft, protocolHash: STUDY_PROTOCOL_HASH }, previousCheckpointHash, checkpointDirectory, checkpoint.manifest);
+      const prepared = await checkpointStorageStep('CHECKPOINT_PREPARE', () => prepareContinuousCheckpoint(checkpoint.directory, checkpoint.segment,
+        { ...draft, protocolHash: STUDY_PROTOCOL_HASH }, previousCheckpointHash, checkpointDirectory, checkpoint.manifest), signal);
       const name = `checkpoint-${checkpoint.manifest.runId}-${String(checkpoint.segment.index).padStart(6, '0')}.tar.gz`;
-      const archive = await archiveChunk(prepared.directory, name, undefined, signal);
+      const archive = await checkpointStorageStep('ARCHIVE_CREATE',
+        () => archiveChunk(prepared.directory, name, undefined, signal), signal);
       const asset = await uploadConfirmedAsset(repository, archive, signal);
       checkpoints.push({ ...continuousAsset(asset, archive), index: checkpoint.segment.index,
         checkpointHash: prepared.checkpointHash, lastReceivedAt: checkpoint.segment.lastReceivedAt });
@@ -1198,7 +1300,7 @@ async function recordContinuousStudy(repository: string, workspace: string, args
           lastReceivedAt: checkpoint.segment.lastReceivedAt, confirmedAt: new Date().toISOString() });
         const current = operation.plan.chunks.find(chunk => Date.parse(chunk.plannedEnd) > Date.parse(checkpoint.segment.lastReceivedAt));
         operation.currentChunkIndex = current?.index;
-        await saveOperation(repository, operation);
+        await checkpointStorageStep('OPERATION_UPDATE', () => saveOperation(repository, operation, signal), signal);
       }
       appendStudySummary(`Контрольная точка ${checkpoint.segment.index}: приватный архив подтверждён, поток продолжается.`);
     },
@@ -1213,7 +1315,8 @@ async function recordContinuousStudy(repository: string, workspace: string, args
   atomicJson(path.join(directory, 'continuous-block.json'), block);
   return preserveContinuousRaw(persistStopped, async () => {
     // Preserve raw input even if acquisition or later scientific processing failed.
-    const archive = await archiveChunk(directory, `continuous-block-${manifest.runId}.tar.gz`);
+    const archive = await checkpointStorageStep('ARCHIVE_CREATE',
+      () => archiveChunk(directory, `continuous-block-${manifest.runId}.tar.gz`));
     const asset = await uploadConfirmedAsset(repository, archive);
     return { directory, block, manifest, source: continuousAsset(asset, archive), checkpointDirectories };
   });
@@ -1285,6 +1388,7 @@ export async function reconcileContinuousBlocks(repository: string, workspace: s
   let ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
   for (const asset of (await releaseAssets(repository)).filter(item => item.name.startsWith('continuous-block-'))) {
     try {
+    if (asset.state !== 'uploaded') throw new Error('Continuous recovery asset is not uploaded');
     // Every source has a private completion marker only after all window receipts are committed.
     const markerPath = `continuous-completed/${asset.id}.json`;
     const marker = await readRemoteText(repository, markerPath);
@@ -1333,6 +1437,57 @@ async function continuousBlockProcessing(repository: string, ledger: StudyLedger
   return false;
 }
 
+/** The same immutable private upload used by capture, without discovery, ledger or operation writes. */
+export async function uploadContinuousStartupDiagnostic(repository: string, workspace: string,
+  runId: string, runAttempt: number, signal: AbortSignal): Promise<{ assetId: number; assetName: string; assetDigest: string | undefined;
+    assetBytes: number; archiveSha256: string }> {
+  if (!/^\d+$/.test(runId) || !Number.isSafeInteger(runAttempt) || runAttempt <= 0) throw new Error('Invalid startup diagnostic identity');
+  signal.throwIfAborted();
+  mkdirSync(workspace, { recursive: true });
+  const probe = mkdtempSync(path.join(workspace, 'continuous-start-'));
+  let archive: string | undefined;
+  try {
+    atomicJson(path.join(probe, 'startup.json'), { attemptId: `${runId}:${runAttempt}`,
+      acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH, diagnosticOnly: true });
+    archive = await archiveChunk(probe, `continuous-start-${runId}-${runAttempt}.tar.gz`, undefined, signal);
+    const archiveSha256 = sha256File(archive);
+    const asset = await uploadConfirmedAsset(repository, archive, signal);
+    return { assetId: asset.id, assetName: asset.name, assetDigest: asset.digest, assetBytes: asset.size, archiveSha256 };
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+    if (archive) rmSync(archive, { force: true });
+  }
+}
+
+/** Keep the private write and refreshed admission outside the counted attempt. */
+export async function runContinuousStartupPrecount<T>(signal: AbortSignal, probe: () => Promise<unknown>,
+  revalidateAndCount: () => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  await probe();
+  signal.throwIfAborted();
+  return revalidateAndCount();
+}
+
+export function continuousCaptureAdmission(ledger: StudyLedger, plan: StudyBlockPlan, runId: string,
+  runAttempt: number, nowMs: number): { reason: string | null; remaining: StudyChunkPlan[] } {
+  const decision = planStudyRun(ledger, { event: 'schedule', campaignEnabled: true, runId, runAttempt, sessionDate: plan.sessionDate });
+  if (decision.action !== 'CAPTURE') return { reason: decision.action, remaining: [] };
+  if (ledger.attempts.some(item => item.attemptId === `${runId}:${runAttempt}`)) return { reason: 'DUPLICATE_ATTEMPT', remaining: [] };
+  if (studyBlockRecorded(ledger, plan)) return { reason: 'BLOCK_ALREADY_RECORDED', remaining: [] };
+  const remaining = remainingStudyChunks(plan, ledger, nowMs);
+  if (!remaining.length || nowMs >= Date.parse(plan.ownedEnd) - STUDY_CHUNK_END_MARGIN_MS) {
+    return { reason: 'NO_REMAINING_WINDOWS', remaining: [] };
+  }
+  return { reason: null, remaining };
+}
+
+/** Preserve the selected ownership when a slow private write crosses a block boundary. */
+export function refreshContinuousCapturePlan(selected: StudyBlockPlan, requestedBlock: StudyBlock,
+  nowMs: number): StudyBlockPlan | null {
+  const refreshed = planRecoverableStudyBlock(selected.sessionDate, selected.mainStart, selected.mainEnd, requestedBlock, nowMs);
+  return refreshed?.sessionDate === selected.sessionDate && refreshed.block === selected.block ? refreshed : null;
+}
+
 export async function captureContinuousStudyBlock(repository: string, block: StudyBlock, workspace: string,
   runId: string, runAttempt: number, signal: AbortSignal): Promise<BlockResult> {
   if (process.env.MARKET_STUDY_ENABLED !== 'true') throw new Error('Market study capture is paused');
@@ -1348,36 +1503,62 @@ export async function captureContinuousStudyBlock(repository: string, block: Stu
   if (await continuousBlockProcessing(repository, recovered, plan)) {
     return { action: 'SKIPPED', reason: 'BLOCK_PROCESSING', chunks: 0, reportPath: null };
   }
-  if (studyBlockRecorded(recovered, plan)) return { action: 'SKIPPED', reason: 'BLOCK_ALREADY_RECORDED', chunks: 0,
-    reportPath: await maybeFinalizeStudyDay(repository, plan, workspace) };
+  const initialAdmission = continuousCaptureAdmission(recovered, plan, runId, runAttempt, Date.now());
+  if (initialAdmission.reason === 'BLOCK_ALREADY_RECORDED') return { action: 'SKIPPED', reason: initialAdmission.reason,
+    chunks: 0, reportPath: await maybeFinalizeStudyDay(repository, plan, workspace) };
+  if (initialAdmission.reason) return { action: 'SKIPPED', reason: initialAdmission.reason, chunks: 0, reportPath: null };
   assertFrozenRuntime(recovered);
-  const remaining = remainingStudyChunks(plan, recovered, Date.now());
-  if (!remaining.length) return { action: 'SKIPPED', reason: 'NO_REMAINING_WINDOWS', chunks: 0, reportPath: null };
   const attemptId = `${runId}:${runAttempt}`;
-  const ledger = await updateRemoteLedger(repository, current => beginStudyAttempt(current, { runId, runAttempt,
-    sessionDate: plan.sessionDate, block: plan.block, mode: 'COUNTED', startedAt: new Date().toISOString() }), 'Begin continuous capture');
+  const startup = await runContinuousStartupPrecount(signal,
+    () => uploadContinuousStartupDiagnostic(repository, workspace, runId, runAttempt, signal),
+    async (): Promise<{ ledger: StudyLedger; plan: StudyBlockPlan; remaining: StudyChunkPlan[] } | BlockResult> => {
+      const refreshedPlan = refreshContinuousCapturePlan(plan, block, Date.now());
+      // A slow probe must not silently change the selected block or study date.
+      if (!refreshedPlan) {
+        return { action: 'SKIPPED', reason: 'OUTSIDE_BLOCK_WINDOW', chunks: 0, reportPath: null };
+      }
+      const latest = (await readRemoteFile<StudyLedger>(repository, STATE_PATH, signal)).value;
+      signal.throwIfAborted();
+      if (await continuousBlockProcessing(repository, latest, refreshedPlan)) {
+        return { action: 'SKIPPED', reason: 'BLOCK_PROCESSING', chunks: 0, reportPath: null };
+      }
+      signal.throwIfAborted();
+      const refreshedAdmission = continuousCaptureAdmission(latest, refreshedPlan, runId, runAttempt, Date.now());
+      if (refreshedAdmission.reason === 'BLOCK_ALREADY_RECORDED') return { action: 'SKIPPED',
+        reason: refreshedAdmission.reason, chunks: 0,
+        reportPath: await maybeFinalizeStudyDay(repository, refreshedPlan, workspace) };
+      if (refreshedAdmission.reason) return { action: 'SKIPPED', reason: refreshedAdmission.reason, chunks: 0, reportPath: null };
+      assertFrozenRuntime(latest);
+      signal.throwIfAborted();
+      const ledger = await updateRemoteLedger(repository, current => beginStudyAttempt(current, { runId, runAttempt,
+        sessionDate: refreshedPlan.sessionDate, block: refreshedPlan.block, mode: 'COUNTED',
+        startedAt: new Date().toISOString() }), 'Begin continuous capture', { signal, validateCurrent: current => {
+        const admission = continuousCaptureAdmission(current, refreshedPlan, runId, runAttempt, Date.now());
+        if (admission.reason) throw new Error(`Continuous attempt admission changed: ${admission.reason}`);
+        assertFrozenRuntime(current);
+      } });
+      return { ledger, plan: refreshedPlan, remaining: refreshedAdmission.remaining };
+    });
+  if ('action' in startup) return startup;
+  const { ledger, plan: capturePlan, remaining } = startup;
   const phase = ledger.attempts.find(item => item.attemptId === attemptId)?.phase;
   if (!phase) throw new Error('Continuous attempt phase missing');
-  const operation: BlockOperation = { schemaVersion: 1, attemptId, plan, startedAt: new Date().toISOString(),
+  const operation: BlockOperation = { schemaVersion: 1, attemptId, plan: capturePlan, startedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(), state: 'STARTING', failure: null, parts: [], captureFormat: 'continuous-v2',
     checkpointIntervalMs: continuousCapturePolicy.intervalMs, checkpoints: [] };
   await saveOperation(repository, operation);
   try {
-    // This authenticated private write precedes acquisition; market quality is evaluated in-band.
-    const probe = mkdtempSync(path.join(workspace, 'continuous-start-'));
-    atomicJson(path.join(probe, 'startup.json'), { attemptId, acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH, diagnosticOnly: true });
-    await uploadConfirmedAsset(repository, await archiveChunk(probe, `continuous-start-${runId}-${runAttempt}.tar.gz`), signal);
-    await waitUntil(Math.max(Date.parse(plan.captureNotBefore), Date.parse(remaining[0].plannedStart)), signal);
-    const stopAt = Date.parse(plan.ownedEnd) - STUDY_CHUNK_END_MARGIN_MS;
+    await waitUntil(Math.max(Date.parse(capturePlan.captureNotBefore), Date.parse(remaining[0].plannedStart)), signal);
+    const stopAt = Date.parse(capturePlan.ownedEnd) - STUDY_CHUNK_END_MARGIN_MS;
     if (stopAt <= Date.now()) throw new Error('Continuous block expired during preparation');
     operation.state = 'CAPTURING'; operation.captureStartedAt = new Date().toISOString(); operation.currentChunkIndex = remaining[0].index; await saveOperation(repository, operation);
     const result = await recordContinuousStudy(repository, workspace, { ...recorderArguments(workspace,
       Math.ceil((stopAt - Date.now()) / 1000), 'main'), captureDeadlineMs: stopAt, parentSignal: signal, setExitCodeOnFailure: false },
     { schemaVersion: 1, kind: 'CONTINUOUS_BLOCK', acquisitionPolicyHash: CONTINUOUS_CAPTURE_POLICY_HASH,
-      attemptId, diagnosticOnly: false, plan, phase, replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()) }, operation);
+      attemptId, diagnosticOnly: false, plan: capturePlan, phase, replayConfigHash: replayConfigHash(), simulatorHashes: replaySourceHashes(process.cwd()) }, operation);
     if (result.manifest.status !== 'COMPLETE' || result.manifest.capture?.reason !== 'duration') throw new Error('Continuous capture incomplete; durable raw evidence preserved');
     operation.state = 'PROCESSING'; await saveOperation(repository, operation);
-    return { action: 'CAPTURED', plan, chunks: 0, reportPath: null,
+    return { action: 'CAPTURED', plan: capturePlan, chunks: 0, reportPath: null,
       rawBlockConfirmed: true, scientificProcessing: 'DEFERRED_TO_REPORT' };
   } catch (error) {
     operation.state = signal.aborted ? 'CANCELLED' : 'FAILED';
@@ -1461,6 +1642,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       output('action', result.action); console.log(JSON.stringify(result)); return;
     }
     const repository = required(values, '--repo');
+    if (command === 'startup-storage-probe') {
+      const result = await uploadContinuousStartupDiagnostic(repository,
+        path.resolve(required(values, '--workspace')), required(values, '--run-id'),
+        Number(required(values, '--run-attempt')), controller.signal);
+      console.log(JSON.stringify({ action: 'PRIVATE_STARTUP_ARCHIVE_CONFIRMED', diagnosticOnly: true,
+        counted: false, ...result })); return;
+    }
     if (command === 'report') {
       const dates = await refreshOperationalReports(repository);
       console.log(JSON.stringify({ action: 'OPERATIONAL_REPORTS_UPDATED', dates })); return;
@@ -1471,7 +1659,18 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     if (command === 'status') {
       const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
-      console.log(JSON.stringify({ phase: ledger.phase, attempts: ledger.attempts.length, chunks: ledger.chunks.length, days: ledger.days.length })); return;
+      assertStudyLedgerProtocol(ledger);
+      console.log(JSON.stringify({ phase: ledger.phase, attempts: ledger.attempts.length, chunks: ledger.chunks.length,
+        completedDayReports: ledger.days.length,
+        acceptedDevelopmentDays: new Set(ledger.days.filter(day => day.phase === 'DEVELOPMENT' && day.quality.status === 'PASS').map(day => day.sessionDate)).size,
+        acceptedHoldoutDays: new Set(ledger.days.filter(day => day.phase === 'HOLDOUT' && day.quality.status === 'PASS').map(day => day.sessionDate)).size,
+        rejectedDayReports: ledger.days.filter(day => day.quality.status !== 'PASS').length })); return;
+    }
+    if (command === 'migrate-attempt-budget') {
+      const ledger = await migrateRemoteStudyAttemptBudget(repository, controller.signal);
+      console.log(JSON.stringify({ action: 'ATTEMPT_BUDGET_MIGRATED', protocolHash: ledger.protocolHash,
+        attempts: ledger.attempts.length, limit: STUDY_MAX_ATTEMPTS,
+        sourceLedgerHash: ledger.attemptBudgetMigration?.sourceLedgerHash })); return;
     }
     if (command === 'freeze') {
       const ledger = await updateRemoteLedger(repository, current => freezeStudy(current, { frozenAt: new Date().toISOString(),
@@ -1493,12 +1692,17 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected prepare-block, preflight, smoke, observe, continuous-pilot, run-block, freeze, report, research, or status command');
+    throw new Error('Expected prepare-block, preflight, smoke, observe, continuous-pilot, startup-storage-probe, run-block, freeze, report, research, status, or migrate-attempt-budget command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch(() => { console.error('Market study command failed; inspect the workflow summary and immutable archive.'); process.exitCode = 1; });
+  main().catch(error => {
+    if (error instanceof CheckpointStorageFailure) {
+      console.error(JSON.stringify({ status: 'FAILED', category: 'STUDY_COMMAND_FAILED', ...error.diagnostic }));
+    } else console.error('Market study command failed; inspect the workflow summary and immutable archive.');
+    process.exitCode = 1;
+  });
 }

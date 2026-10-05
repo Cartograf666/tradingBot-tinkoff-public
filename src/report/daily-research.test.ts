@@ -36,7 +36,14 @@ function replay(): ReplayReport {
     limitations: ['original limitation'], results: fixedReplayScenarios().map((scenario, index) => ({ name: scenario.name,
       strategy: index < 2 ? 'momentum' : 'exhaustion', scenario: index % 2 ? 'stress' : 'baseline', signals: index,
       entries: index + 1, closedTrades: index, netPnlRub: index === 0 ? null : index, realizedPnlRub: index,
-      feesRub: index, profitFactor: null, maxDrawdownRub: index, unresolvedPositions: index === 0 ? 1 : 0, economicSuccess: false })) } as ReplayReport;
+      feesRub: index, profitFactor: null, maxDrawdownRub: index, unresolvedPositions: index === 0 ? 1 : 0, economicSuccess: false,
+      observedRisk: { maximumDrawdownRub: index, minimumKnownEquityRub: 100_000 - index,
+        maximumKnownEquityRub: 100_000, latestKnownEquityRub: 100_000 - index,
+        latestKnownAtMs: Date.parse(plan.mainEnd), samples: 2, knownSamples: 1, positionSamples: 1,
+        knownPositionSamples: 0, knownPositionSampleFraction: 0, adjacentKnownEndpointMs: 0, otherIntervalMs: 1,
+        unavailableReasons: { NO_CURRENT_BOOK: 1 }, limitation: 'Observed frames only' },
+      terminalLiquidation: { atMs: Date.parse(plan.mainEnd), equityRub: null, cashRub: 1, reservedCashRub: 0,
+        coverage: { positionCount: 1, fullyLiquidatablePositions: 0 }, unavailableReasons: ['NO_CURRENT_BOOK:a'] } })) } as ReplayReport;
 }
 
 test('selects sorted PASS canonical receipts plus a production-like quality-rejected fallback after close', () => {

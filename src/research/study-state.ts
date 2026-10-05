@@ -1,6 +1,8 @@
 import {
-  STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_REQUIRED_DAYS, STUDY_TICKERS, type StudyBlock,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_REQUIRED_DAYS,
+  STUDY_TICKERS, hashStudyValue, type StudyBlock,
 } from './study-protocol.js';
+import { expectedStudyDayChunks, selectStudyDayInputs, studyDayInputHash } from './study-day-inputs.js';
 
 export type StudyPhase = 'DEVELOPMENT' | 'READY_TO_FREEZE' | 'HOLDOUT' | 'COMPLETE';
 export type StudyRunMode = 'COUNTED' | 'SMOKE';
@@ -86,7 +88,26 @@ export interface StudyLedger {
   days: StudyDayReceipt[];
   freeze: StudyFreeze | null;
   updatedAt: string;
+  attemptBudgetMigration?: StudyAttemptBudgetMigration;
 }
+
+/** Durable proof of the one supported predecessor. Historical receipts keep their original hashes. */
+export interface StudyAttemptBudgetMigration {
+  fromProtocolHash: typeof STUDY_60_ATTEMPT_PROTOCOL_HASH;
+  toProtocolHash: typeof STUDY_PROTOCOL_HASH;
+  sourceLedgerHash: string;
+  migratedAt: string;
+  legacyAttemptCount: 60;
+  legacyChunkCount: number;
+  legacyAttemptIdentityHash: string;
+  legacyChunksHash: string;
+  legacyCanonicalKeys: string[];
+  legacyCanonicalsHash: string;
+}
+
+/** An immutable uploaded report can lose an optimistic race to a newer
+ * quality-selected input. It remains an archived diagnostic, not a day. */
+export class StaleStudyDayInputError extends Error {}
 
 const hash = /^[0-9a-f]{64}$/;
 const digest = /^(?:sha256:)?[0-9a-f]{64}$/;
@@ -97,8 +118,76 @@ export function createStudyLedger(now = new Date().toISOString()): StudyLedger {
     chunks: [], canonicalChunks: {}, days: [], freeze: null, updatedAt: now };
 }
 
-function clone(ledger: StudyLedger): StudyLedger {
+function attemptIdentity(attempt: StudyAttempt): Omit<StudyAttempt, 'status'> {
+  const { status: _status, ...identity } = attempt;
+  return identity;
+}
+
+export function assertStudyLedgerProtocol(ledger: StudyLedger): void {
   if (ledger.schemaVersion !== 1 || ledger.protocolHash !== STUDY_PROTOCOL_HASH) throw new Error('Study ledger protocol mismatch');
+  const migration = ledger.attemptBudgetMigration;
+  if (!migration) {
+    if (ledger.chunks.some(chunk => chunk.protocolHash !== STUDY_PROTOCOL_HASH)
+      || ledger.days.some(day => day.protocolHash !== STUDY_PROTOCOL_HASH)) throw new Error('Study ledger contains foreign receipts');
+    return;
+  }
+  if (migration.fromProtocolHash !== STUDY_60_ATTEMPT_PROTOCOL_HASH || migration.toProtocolHash !== STUDY_PROTOCOL_HASH
+    || !hash.test(migration.sourceLedgerHash) || !Number.isFinite(Date.parse(migration.migratedAt))
+    || migration.legacyAttemptCount !== 60 || !Number.isSafeInteger(migration.legacyChunkCount)
+    || migration.legacyChunkCount < 0 || !hash.test(migration.legacyAttemptIdentityHash)
+    || !hash.test(migration.legacyChunksHash) || !Array.isArray(migration.legacyCanonicalKeys)
+    || new Set(migration.legacyCanonicalKeys).size !== migration.legacyCanonicalKeys.length
+    || migration.legacyCanonicalKeys.some(key => typeof key !== 'string')
+    || !hash.test(migration.legacyCanonicalsHash)
+    || ledger.attempts.length < migration.legacyAttemptCount || ledger.chunks.length < migration.legacyChunkCount
+    || hashStudyValue(ledger.attempts.slice(0, migration.legacyAttemptCount).map(attemptIdentity)) !== migration.legacyAttemptIdentityHash
+    || hashStudyValue(ledger.chunks.slice(0, migration.legacyChunkCount)) !== migration.legacyChunksHash
+    || migration.legacyCanonicalKeys.some(key => !Object.hasOwn(ledger.canonicalChunks, key))
+    || hashStudyValue(Object.fromEntries(migration.legacyCanonicalKeys.map(key => [key, ledger.canonicalChunks[key]])))
+      !== migration.legacyCanonicalsHash
+    || ledger.chunks.slice(migration.legacyChunkCount).some(chunk => chunk.protocolHash !== STUDY_PROTOCOL_HASH)
+    || ledger.days.some(day => day.protocolHash !== STUDY_PROTOCOL_HASH)) {
+    throw new Error('Study attempt-budget migration receipt or historical data changed');
+  }
+}
+
+/** Explicit, one-time transition; a normal writer must never upgrade a ledger on read. */
+export function migrateStudyAttemptBudget(ledger: StudyLedger, migratedAt: string): StudyLedger {
+  if (ledger.protocolHash === STUDY_PROTOCOL_HASH) {
+    assertStudyLedgerProtocol(ledger);
+    if (!ledger.attemptBudgetMigration) throw new Error('Study ledger has no attempt-budget migration receipt');
+    return structuredClone(ledger);
+  }
+  if (ledger.schemaVersion !== 1 || ledger.protocolHash !== STUDY_60_ATTEMPT_PROTOCOL_HASH
+    || ledger.attemptBudgetMigration || ledger.phase !== 'DEVELOPMENT' || ledger.freeze !== null || ledger.days.length !== 0
+    || ledger.attempts.length !== 60 || ledger.attempts.some(attempt => attempt.mode !== 'COUNTED')
+    || ledger.chunks.some(chunk => chunk.protocolHash !== STUDY_60_ATTEMPT_PROTOCOL_HASH)
+    || !Number.isFinite(Date.parse(migratedAt))) throw new Error('Study ledger is not the authorized 60-attempt predecessor');
+  const ids = new Set(ledger.attempts.map(attempt => attempt.attemptId));
+  const assets = new Set(ledger.chunks.map(chunk => chunk.assetId));
+  if (ids.size !== 60 || assets.size !== ledger.chunks.length
+    || ledger.chunks.some(chunk => !ids.has(chunk.attemptId))
+    || Object.entries(ledger.canonicalChunks).some(([key, assetId]) =>
+      !ledger.chunks.some(chunk => chunk.assetId === assetId && chunk.chunkId === key && chunk.quality === 'PASS'))) {
+    throw new Error('Legacy study ledger has inconsistent attempt or canonical identity');
+  }
+  const next = structuredClone(ledger);
+  next.protocolHash = STUDY_PROTOCOL_HASH;
+  next.attemptBudgetMigration = {
+    fromProtocolHash: STUDY_60_ATTEMPT_PROTOCOL_HASH, toProtocolHash: STUDY_PROTOCOL_HASH,
+    sourceLedgerHash: hashStudyValue(ledger), migratedAt, legacyAttemptCount: 60,
+    legacyChunkCount: ledger.chunks.length,
+    legacyAttemptIdentityHash: hashStudyValue(ledger.attempts.map(attemptIdentity)),
+    legacyChunksHash: hashStudyValue(ledger.chunks),
+    legacyCanonicalKeys: Object.keys(ledger.canonicalChunks).sort(),
+    legacyCanonicalsHash: hashStudyValue(ledger.canonicalChunks),
+  };
+  assertStudyLedgerProtocol(next);
+  return next;
+}
+
+function clone(ledger: StudyLedger): StudyLedger {
+  assertStudyLedgerProtocol(ledger);
   return structuredClone(ledger);
 }
 function phaseForCapture(phase: StudyPhase): 'DEVELOPMENT' | 'HOLDOUT' | null {
@@ -167,7 +256,8 @@ export function beginStudyAttempt(
 }
 
 function validateChunk(receipt: StudyChunkReceipt): void {
-  if (receipt.schemaVersion !== 1 || receipt.protocolHash !== STUDY_PROTOCOL_HASH || !Number.isSafeInteger(receipt.assetId)
+  if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash)
+    || !Number.isSafeInteger(receipt.assetId)
     || receipt.assetId <= 0 || !receipt.assetName || !digest.test(receipt.assetDigest) || !hash.test(receipt.archiveSha256)
     || !Number.isSafeInteger(receipt.assetBytes) || receipt.assetBytes <= 0 || !receipt.chunkId || !receipt.attemptId
     || !receipt.sessionDate.match(isoDate) || !['early', 'late'].includes(receipt.block)
@@ -190,6 +280,8 @@ export function acceptStudyChunk(ledger: StudyLedger, receipt: StudyChunkReceipt
     if (JSON.stringify(sameAsset) !== JSON.stringify(receipt)) throw new Error('Artifact identity changed');
     return next;
   }
+  if (receipt.protocolHash !== STUDY_PROTOCOL_HASH) throw new Error('New upload uses a retired study protocol');
+  const finalized = next.days.some(day => day.sessionDate === receipt.sessionDate);
   const sameName = next.chunks.find((chunk) => chunk.assetName === receipt.assetName);
   if (sameName) throw new Error('Artifact name collision');
   const attempt = next.attempts.find((item) => item.attemptId === receipt.attemptId);
@@ -199,22 +291,22 @@ export function acceptStudyChunk(ledger: StudyLedger, receipt: StudyChunkReceipt
     || !sameHashes(receipt.simulatorHashes, next.freeze.simulatorHashes))) throw new Error('Holdout capture differs from the frozen implementation');
   next.chunks.push(structuredClone(receipt));
   attempt.status = 'UPLOADED';
-  if (receipt.quality === 'PASS' && next.canonicalChunks[receipt.chunkId] === undefined) {
+  if (!finalized && receipt.quality === 'PASS' && next.canonicalChunks[receipt.chunkId] === undefined) {
     next.canonicalChunks[receipt.chunkId] = receipt.assetId;
   }
-  next.updatedAt = receipt.uploadedAt;
+  next.updatedAt = [next.updatedAt, receipt.uploadedAt].sort().at(-1)!;
   return next;
 }
 
 function validateDay(receipt: StudyDayReceipt): void {
-  if (receipt.schemaVersion !== 1 || receipt.protocolHash !== STUDY_PROTOCOL_HASH || !receipt.dayId
+  if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash) || !receipt.dayId
     || !receipt.sessionDate.match(isoDate) || !hash.test(receipt.canonicalInputHash) || !hash.test(receipt.replayConfigHash)
     || !receipt.chunkAssetIds.length || new Set(receipt.chunkAssetIds).size !== receipt.chunkAssetIds.length
     || !Number.isFinite(receipt.quality.recordedShare) || receipt.quality.recordedShare < 0 || receipt.quality.recordedShare > 1
     || !Number.isSafeInteger(receipt.quality.expectedTicks) || receipt.quality.expectedTicks <= 0
     || !Number.isSafeInteger(receipt.quality.observedTicks) || receipt.quality.observedTicks < 0
     || receipt.quality.observedTicks > receipt.quality.expectedTicks
-    || receipt.dayId !== `${STUDY_PROTOCOL_HASH}:${receipt.sessionDate}`
+    || receipt.dayId !== `${receipt.protocolHash}:${receipt.sessionDate}`
     || !Number.isSafeInteger(receipt.reportAssetId) || receipt.reportAssetId <= 0 || !receipt.reportAssetName
     || !digest.test(receipt.reportAssetDigest) || !Number.isSafeInteger(receipt.reportAssetBytes) || receipt.reportAssetBytes <= 0
     || !hash.test(receipt.reportArchiveSha256) || Object.keys(receipt.simulatorHashes).length === 0
@@ -237,6 +329,48 @@ function updatePhase(ledger: StudyLedger): void {
   if (ledger.phase === 'HOLDOUT' && passedDates(ledger, 'HOLDOUT').length >= STUDY_REQUIRED_DAYS) ledger.phase = 'COMPLETE';
 }
 
+function assertDayInputs(ledger: StudyLedger, receipt: StudyDayReceipt): void {
+  const expected = expectedStudyDayChunks(receipt);
+  if (receipt.chunkAssetIds.length !== expected.length) {
+    throw new Error('Full study day requires every planned receipt from one phase');
+  }
+  const selected = receipt.chunkAssetIds.map((assetId, index) => {
+    const chunk = ledger.chunks.find(item => item.assetId === assetId);
+    const planned = expected[index]!;
+    if (!chunk || chunk.chunkId !== planned.key || chunk.sessionDate !== receipt.sessionDate
+      || chunk.phase !== receipt.phase || chunk.plannedStart !== planned.chunk.plannedStart
+      || chunk.plannedEnd !== planned.chunk.plannedEnd) {
+      throw new Error('Daily receipt does not match every exact planned window and phase');
+    }
+    return chunk;
+  });
+  if (studyDayInputHash(selected) !== receipt.canonicalInputHash) {
+    throw new Error('Daily receipt does not match the immutable full-day input selection');
+  }
+  if (selected.some(chunk => chunk.replayConfigHash !== receipt.replayConfigHash
+    || !sameHashes(chunk.simulatorHashes, receipt.simulatorHashes))) {
+    throw new Error('Daily replay differs from the capture-time implementation');
+  }
+}
+
+function assertFreshDaySelection(ledger: StudyLedger, receipt: StudyDayReceipt): void {
+  const selection = selectStudyDayInputs(ledger, receipt);
+  if (selection.receipts.length !== selection.expectedCount || selection.phase !== receipt.phase) {
+    throw new Error('Full study day requires every planned receipt from one phase');
+  }
+  if (JSON.stringify(selection.receipts.map(chunk => chunk.assetId)) !== JSON.stringify(receipt.chunkAssetIds)) {
+    throw new StaleStudyDayInputError('Recovered day report is stale relative to the deterministic input selection');
+  }
+}
+
+function pinDayCanonicals(ledger: StudyLedger, day: StudyDayReceipt): void {
+  for (const assetId of day.chunkAssetIds) {
+    const chunk = ledger.chunks.find(item => item.assetId === assetId)!;
+    if (chunk.quality === 'PASS') ledger.canonicalChunks[chunk.chunkId] = assetId;
+    else delete ledger.canonicalChunks[chunk.chunkId];
+  }
+}
+
 export function acceptStudyDay(ledger: StudyLedger, receipt: StudyDayReceipt): StudyLedger {
   validateDay(receipt);
   const next = clone(ledger);
@@ -245,24 +379,11 @@ export function acceptStudyDay(ledger: StudyLedger, receipt: StudyDayReceipt): S
     if (JSON.stringify(existing) !== JSON.stringify(receipt)) throw new Error('Finalized study day changed');
     return next;
   }
+  if (receipt.protocolHash !== STUDY_PROTOCOL_HASH) throw new Error('New day report uses a retired study protocol');
   if (receipt.phase !== phaseForCapture(next.phase)) throw new Error('Day phase does not match ledger phase');
   if (receipt.phase === 'HOLDOUT' && next.freeze?.developmentDates.includes(receipt.sessionDate)) throw new Error('Development day leaked into holdout');
-  const chunks = receipt.chunkAssetIds.map((id) => next.chunks.find((chunk) => chunk.assetId === id));
-  if (chunks.some((chunk) => !chunk)) throw new Error('Daily receipt references an unknown release asset');
-  if (!chunks.some((chunk) => chunk!.block === 'early') || !chunks.some((chunk) => chunk!.block === 'late')) {
-    throw new Error('Full study day requires both ownership blocks');
-  }
-  if (chunks.some((chunk) => chunk!.sessionDate !== receipt.sessionDate || chunk!.phase !== receipt.phase
-    || next.canonicalChunks[chunk!.chunkId] !== chunk!.assetId)) throw new Error('Daily receipt must use canonical chunks from one phase and date');
-  if (chunks.some(chunk => chunk!.replayConfigHash !== receipt.replayConfigHash
-    || !sameHashes(chunk!.simulatorHashes, receipt.simulatorHashes))) {
-    throw new Error('Daily replay differs from the capture-time implementation');
-  }
-  const allCanonical = next.chunks.filter(chunk => chunk.sessionDate === receipt.sessionDate
-    && chunk.phase === receipt.phase && next.canonicalChunks[chunk.chunkId] === chunk.assetId).map(chunk => chunk.assetId).sort((a, b) => a - b);
-  if (JSON.stringify([...receipt.chunkAssetIds].sort((a, b) => a - b)) !== JSON.stringify(allCanonical)) {
-    throw new Error('Daily receipt omits a canonical chunk');
-  }
+  assertDayInputs(next, receipt);
+  assertFreshDaySelection(next, receipt);
   if (receipt.phase === 'HOLDOUT' && (!next.freeze || receipt.replayConfigHash !== next.freeze.replayConfigHash
     || !sameHashes(receipt.simulatorHashes, next.freeze.simulatorHashes))) {
     throw new Error('Holdout replay differs from the frozen implementation');
@@ -274,6 +395,7 @@ export function acceptStudyDay(ledger: StudyLedger, receipt: StudyDayReceipt): S
     throw new Error('Passing development days must use one replay implementation');
   }
   next.days.push(structuredClone(receipt));
+  pinDayCanonicals(next, receipt);
   next.updatedAt = receipt.finalizedAt;
   updatePhase(next);
   return next;
@@ -314,6 +436,10 @@ export function freezeStudy(
 /** Union receipts from two optimistic-SHA writers; immutable collisions fail instead of overwriting. */
 export function mergeStudyLedgers(left: StudyLedger, right: StudyLedger): StudyLedger {
   const merged = clone(left), incoming = clone(right);
+  if (JSON.stringify(merged.attemptBudgetMigration ?? null) !== JSON.stringify(incoming.attemptBudgetMigration ?? null)) {
+    throw new Error('Conflicting study attempt-budget migrations');
+  }
+  const leftCanonicals = { ...merged.canonicalChunks };
   if (merged.freeze && incoming.freeze && JSON.stringify(merged.freeze) !== JSON.stringify(incoming.freeze)) throw new Error('Conflicting study freezes');
   merged.freeze ??= incoming.freeze;
   for (const attempt of incoming.attempts) {
@@ -329,20 +455,30 @@ export function mergeStudyLedgers(left: StudyLedger, right: StudyLedger): StudyL
   if (merged.attempts.length > STUDY_MAX_ATTEMPTS) throw new Error('Concurrent study attempts exceed the campaign limit');
   for (const chunk of incoming.chunks) Object.assign(merged, acceptStudyChunk(merged, chunk));
   merged.canonicalChunks = {};
-  for (const chunk of [...merged.chunks].sort((a, b) => a.assetId - b.assetId)) {
-    if (chunk.quality === 'PASS' && merged.canonicalChunks[chunk.chunkId] === undefined) merged.canonicalChunks[chunk.chunkId] = chunk.assetId;
+  // A successful optimistic write on the remote branch precedes the stale
+  // writer. Asset IDs are upload order, not ledger acceptance order.
+  for (const mapping of [leftCanonicals, incoming.canonicalChunks]) {
+    for (const [chunkId, assetId] of Object.entries(mapping)) {
+      const chunk = merged.chunks.find(item => item.assetId === assetId);
+      if (!chunk || chunk.chunkId !== chunkId || chunk.quality !== 'PASS') {
+        throw new Error('Merged canonical mapping lacks its quality-passing receipt');
+      }
+      merged.canonicalChunks[chunkId] ??= assetId;
+    }
   }
   for (const day of incoming.days) {
     const current = merged.days.find(item => item.dayId === day.dayId);
     if (current && JSON.stringify(current) !== JSON.stringify(day)) throw new Error('Conflicting finalized study days');
-    if (!current) merged.days.push(structuredClone(day));
+    if (!current) {
+      assertDayInputs(merged, day);
+      assertFreshDaySelection(merged, day);
+      merged.days.push(structuredClone(day));
+    }
   }
+  for (const day of merged.days) pinDayCanonicals(merged, day);
   for (const day of merged.days) {
     validateDay(day);
-    for (const assetId of day.chunkAssetIds) {
-      const chunk = merged.chunks.find(item => item.assetId === assetId);
-      if (!chunk || merged.canonicalChunks[chunk.chunkId] !== assetId) throw new Error('Merge would shift a finalized canonical chunk');
-    }
+    assertDayInputs(merged, day);
   }
   const developmentDays = merged.days.filter(day => day.phase === 'DEVELOPMENT' && day.quality.status === 'PASS');
   if (developmentDays.some(day => day.replayConfigHash !== developmentDays[0]?.replayConfigHash

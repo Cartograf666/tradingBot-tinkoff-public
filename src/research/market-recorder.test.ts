@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import test from 'node:test';
+import { CaptureTiming } from './capture-timing.js';
 import { captureMarketStream } from './market-recorder.js';
 import type { RecordedEventKind } from './market-recording.js';
 
@@ -45,6 +46,53 @@ test('fractional monotonic start preserves the final tick at the exact capture b
   assert.equal(result.ticks, 60);
   assert.deepEqual(events.filter(event => event.kind === 'tick').map(event => event.payload),
     Array.from({ length: 60 }, (_, index) => ({ elapsedMs: (index + 1) * 1000, skippedIntervals: 0 })));
+  assert.equal(events.at(-1)?.kind, 'stop');
+});
+
+test('injected diagnostic clock measures SDK handoff, append return and acknowledgment without changing raw order', async () => {
+  const events: CapturedEvent[] = [];
+  const observedTimes = [10, 11, 13, 14, 16];
+  const result = await captureMarketStream({
+    openStream: () => ({ async *[Symbol.asyncIterator]() {
+      yield { orderbook: { instrumentUid: 'uid-a' }, acknowledgments: [{ key: 'book:uid-a', success: true }] };
+      await new Promise(() => undefined);
+    } }),
+    record: eventsRecorder(events), expectedSubscriptions: ['book:uid-a'],
+    acknowledgments: value => (value as { acknowledgments: Array<{ key: string; success: boolean }> }).acknowledgments,
+    durationMs: 15, tickIntervalMs: 1000, heartbeatTimeoutMs: 100,
+    timingInstrumentUids: ['uid-a'], timingNowMs: () => observedTimes.shift()!,
+  });
+  assert.equal(result.reason, 'duration');
+  assert.equal(result.acknowledgments, 1);
+  assert.deepEqual(events.map(event => event.kind), ['connect_attempt', 'response', 'stop']);
+  assert.equal(observedTimes.length, 0);
+  assert.equal(result.timing?.allResponses.sdkYieldToDispatchMs.maxMs, 1);
+  assert.equal(result.timing?.allResponses.dispatchToAppendReturnMs.maxMs, 2);
+  assert.equal(result.timing?.allResponses.acknowledgmentHandlingMs.maxMs, 2);
+  assert.equal(result.timing?.bookResponsesByInstrument['uid-a'].dispatchToAppendReturnMs.count, 1);
+});
+
+test('optional timing failure cannot fail capture or change raw event order', async () => {
+  class FailingTiming extends CaptureTiming {
+    override observeResponse(): void { throw new Error('diagnostic failed'); }
+    override observeTickDeadlineDrift(): void { throw new Error('diagnostic failed'); }
+    override finish(): never { throw new Error('diagnostic failed'); }
+  }
+  const events: CapturedEvent[] = [];
+  const result = await captureMarketStream({
+    openStream: () => ({ async *[Symbol.asyncIterator]() {
+      yield { orderbook: { instrumentUid: 'uid-a' } };
+      await new Promise(() => undefined);
+    } }),
+    record: eventsRecorder(events), expectedSubscriptions: [], acknowledgments: () => [],
+    durationMs: 20, tickIntervalMs: 5, heartbeatTimeoutMs: 100,
+    timingCollector: new FailingTiming(),
+  });
+  assert.equal(result.reason, 'duration');
+  assert.equal(result.responses, 1);
+  assert.equal(result.timing, undefined);
+  assert.equal(events[0].kind, 'connect_attempt');
+  assert.equal(events[1].kind, 'response');
   assert.equal(events.at(-1)?.kind, 'stop');
 });
 

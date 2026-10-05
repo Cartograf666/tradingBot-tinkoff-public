@@ -74,7 +74,18 @@ export interface SimulationResult {
   maxDrawdownRub: number; economicSuccess: false;
 }
 
-type BookState = { book: DepthBook; atMs: number; offset: bigint; epoch: number };
+/** A read-only valuation at the latest received event. Null means the current
+ * frames cannot support a full liquidation of every open position. */
+export interface LiquidationSnapshot {
+  atMs: number | null;
+  equityRub: number | null;
+  cashRub: number;
+  reservedCashRub: number;
+  coverage: { positionCount: number; fullyLiquidatablePositions: number };
+  unavailableReasons: readonly string[];
+}
+
+type BookState = { book: DepthBook; atMs: number; sourceAtMs: number; offset: bigint; epoch: number };
 type PendingEntry = { instrumentUid: string; signalAtMs: number; arrivalAtMs: number; reservedRub: number; reason: string };
 type PendingExit = { instrumentUid: string; signalAtMs: number; arrivalAtMs: number; reason: string };
 type Position = OpenPosition & { entryOrderId: number; feesRub: number };
@@ -211,7 +222,7 @@ export class OrderBookSimulator {
     }
     this.lastBookSourceTimestamp.set(instrument.uid, quality.timestampMs);
     if (!this.marketAllowed(instrument.uid, atMs, source)) { this.books.delete(instrument.uid); return; }
-    const state: BookState = { book: cloneBook(quality.book), atMs, offset, epoch: event.connectionEpoch };
+    const state: BookState = { book: cloneBook(quality.book), atMs, sourceAtMs: quality.timestampMs, offset, epoch: event.connectionEpoch };
     this.books.set(instrument.uid, state);
     this.recordPrice(instrument.uid, state);
     this.executePending(instrument.uid, state);
@@ -330,6 +341,31 @@ export class OrderBookSimulator {
     const inventoryAtCost = [...this.positions.values()].reduce((sum, position) => sum + position.entryCostRub, 0);
     const equity = this.cash + this.reserved + inventoryAtCost;
     this.peakEquity = Math.max(this.peakEquity, equity); this.maxDrawdown = Math.max(this.maxDrawdown, this.peakEquity - equity);
+  }
+
+
+  liquidationSnapshot(): LiquidationSnapshot {
+    const atMs = this.previousAtMs;
+    if (atMs === null) return { atMs, equityRub: null, cashRub: this.cash, reservedCashRub: this.reserved,
+      coverage: { positionCount: this.positions.size, fullyLiquidatablePositions: 0 }, unavailableReasons: ['NO_RECEIPT_TIME'] };
+    const reasons: string[] = [];
+    let liquidation = 0, covered = 0;
+    for (const position of this.positions.values()) {
+      const state = this.books.get(position.instrumentUid);
+      if (!state) { reasons.push(`NO_CURRENT_BOOK:${position.instrumentUid}`); continue; }
+      if (state.epoch !== this.epoch) { reasons.push(`EPOCH_MISMATCH:${position.instrumentUid}`); continue; }
+      if (!this.marketAllowed(position.instrumentUid, atMs, 'EXCHANGE')) { reasons.push(`MARKET_NOT_ALLOWED:${position.instrumentUid}`); continue; }
+      const receiptAgeMs = atMs - state.atMs, sourceAgeMs = atMs - state.sourceAtMs;
+      if (receiptAgeMs < 0 || receiptAgeMs > this.manifest.settings.maxBookAgeMs) { reasons.push(`STALE_RECEIPT_BOOK:${position.instrumentUid}`); continue; }
+      if (sourceAgeMs < 0 || sourceAgeMs > this.manifest.settings.maxBookAgeMs) { reasons.push(`STALE_SOURCE_BOOK:${position.instrumentUid}`); continue; }
+      const instrument = this.manifest.instruments.find(item => item.uid === position.instrumentUid)!;
+      const execution = quoteBookForLots(state.book, position.lots, instrument.lot, this.config.commissionRate);
+      if (execution.lots !== position.lots || execution.vwap === null) { reasons.push(`INSUFFICIENT_BID_DEPTH:${position.instrumentUid}`); continue; }
+      liquidation += execution.gross - execution.fee; covered++;
+    }
+    return { atMs, equityRub: reasons.length ? null : this.cash + this.reserved + liquidation,
+      cashRub: this.cash, reservedCashRub: this.reserved,
+      coverage: { positionCount: this.positions.size, fullyLiquidatablePositions: covered }, unavailableReasons: reasons };
   }
 
   finish(): SimulationResult {

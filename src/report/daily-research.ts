@@ -1,5 +1,6 @@
 import type { ReplayReport } from './replay-orderbook.js';
-import { hashStudyValue, planStudyBlock, type StudyBlockPlan, type StudyChunkPlan } from '../research/study-protocol.js';
+import { hashStudyValue, type StudyBlockPlan } from '../research/study-protocol.js';
+import { selectStudyDayInputs } from '../research/study-day-inputs.js';
 import type { StudyChunkReceipt, StudyLedger } from '../research/study-state.js';
 
 /** A closed-session replay is a diagnostic artifact, never an acceptance record. */
@@ -27,22 +28,6 @@ export type DailyResearchInputSelection = {
   fullDayAccepted: boolean;
 };
 
-function receiptKey(receipt: StudyChunkReceipt): string {
-  return `${receipt.sessionDate}:${receipt.block}:${receipt.chunkIndex}`;
-}
-
-function expectedDayChunks(plan: StudyBlockPlan): Array<{ key: string; chunk: StudyChunkPlan }> {
-  const early = planStudyBlock(plan.sessionDate, plan.mainStart, plan.mainEnd, 'early', Date.parse(`${plan.sessionDate}T05:50:00.000Z`));
-  const late = planStudyBlock(plan.sessionDate, plan.mainStart, plan.mainEnd, 'late', Date.parse(`${plan.sessionDate}T10:50:00.000Z`));
-  if (!early || !late) throw new Error('Cannot reconstruct full-day research bounds');
-  return [early, late].flatMap(block => block.chunks.map(chunk => ({ key: `${plan.sessionDate}:${block.block}:${chunk.index}`, chunk })));
-}
-
-function matchesExpectedReceipt(receipt: StudyChunkReceipt, key: string, chunk: StudyChunkPlan): boolean {
-  return receipt.chunkId === key && receiptKey(receipt) === key && receipt.plannedStart === chunk.plannedStart
-    && receipt.plannedEnd === chunk.plannedEnd;
-}
-
 function acceptedDay(ledger: StudyLedger, plan: StudyBlockPlan, phase: 'DEVELOPMENT' | 'HOLDOUT' | null): boolean {
   return phase !== null && ledger.days.some(day => day.sessionDate === plan.sessionDate && day.phase === phase
     && day.mainStart === plan.mainStart && day.mainEnd === plan.mainEnd && day.quality.status === 'PASS');
@@ -55,38 +40,12 @@ function acceptedDay(ledger: StudyLedger, plan: StudyBlockPlan, phase: 'DEVELOPM
  */
 export function selectDailyResearchInputs(ledger: StudyLedger, plan: StudyBlockPlan, nowMs = Date.now()): DailyResearchInputSelection {
   if (!Number.isFinite(nowMs) || !Number.isFinite(Date.parse(plan.mainEnd))) throw new Error('Invalid daily research clock');
-  const expected = expectedDayChunks(plan), expectedByKey = new Map(expected.map(item => [item.key, item.chunk]));
-  const assets = new Map<number, string>();
-  for (const receipt of ledger.chunks.filter(item => item.sessionDate === plan.sessionDate)) {
-    const previous = assets.get(receipt.assetId);
-    if (previous) throw new Error(`Asset ${receipt.assetId} appears more than once in daily chunk receipts`);
-    assets.set(receipt.assetId, receipt.chunkId);
-    const chunk = expectedByKey.get(receipt.chunkId);
-    if (!chunk || !matchesExpectedReceipt(receipt, receipt.chunkId, chunk)) throw new Error(`Chunk ${receipt.chunkId} does not match full-day planned bounds`);
-  }
-  const receipts: StudyChunkReceipt[] = [];
-  for (const { key, chunk } of expected) {
-    const canonicalAssetId = ledger.canonicalChunks[key];
-    const candidates = ledger.chunks.filter(receipt => matchesExpectedReceipt(receipt, key, chunk));
-    let selected: StudyChunkReceipt | undefined;
-    if (canonicalAssetId !== undefined) {
-      const canonical = ledger.chunks.filter(receipt => receipt.assetId === canonicalAssetId);
-      if (canonical.length !== 1 || !matchesExpectedReceipt(canonical[0]!, key, chunk)) throw new Error(`Canonical chunk ${key} has no unique matching receipt`);
-      selected = canonical[0]!;
-    } else if (candidates.length) {
-      selected = [...candidates].sort((left, right) => left.uploadedAt.localeCompare(right.uploadedAt) || left.assetId - right.assetId)[0]!;
-    }
-    if (selected) receipts.push(selected);
-  }
-  receipts.sort((left, right) => left.plannedStart.localeCompare(right.plannedStart) || left.chunkIndex - right.chunkIndex);
-  const phases = new Set(receipts.map(receipt => receipt.phase));
-  if (phases.size > 1) throw new Error('Daily research inputs span multiple phases');
-  const phase = phases.values().next().value as 'DEVELOPMENT' | 'HOLDOUT' | undefined;
-  const fullDayAccepted = acceptedDay(ledger, plan, phase ?? null);
+  const { receipts, phase } = selectStudyDayInputs(ledger, plan);
+  const fullDayAccepted = acceptedDay(ledger, plan, phase);
   if (nowMs < Date.parse(plan.mainEnd)) return { action: 'open', sessionDate: plan.sessionDate,
-    phase: phase ?? null, plan, receipts, fullDayAccepted };
+    phase, plan, receipts, fullDayAccepted };
   if (!receipts.length || !phase) return { action: 'noinput', sessionDate: plan.sessionDate,
-    phase: phase ?? null, plan, receipts, fullDayAccepted };
+    phase, plan, receipts, fullDayAccepted };
   if (phase !== 'DEVELOPMENT') throw new Error('Automatic daily diagnostics are limited to DEVELOPMENT');
   return { action: 'closed', sessionDate: plan.sessionDate, phase, plan, receipts, fullDayAccepted };
 }

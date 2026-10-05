@@ -4,8 +4,19 @@ import { performance } from 'node:perf_hooks';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { captureMarketStream } from '../research/market-recorder.js';
 import { TinkoffApiError } from 'tinkoff-invest-api';
-import { boundedCaptureDuration, captureCompletionReason, normalizeCaptureStop, recorderFailure } from './record-market.js';
+import { boundedCaptureDuration, captureCompletionReason, normalizeCaptureStop, recorderCodeHashes, recorderFailure } from './record-market.js';
 import { captureDeadlineSignal, MetadataRequestFailure } from './metadata-retry.js';
+
+test('capture manifest hashes the timing implementation used by the recorder', async () => {
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  const { resolve } = await import('node:path');
+  const root = process.cwd();
+  const hashes = recorderCodeHashes(root);
+  const file = 'src/research/capture-timing.ts';
+  assert.equal(hashes[file], createHash('sha256').update(readFileSync(resolve(root, file))).digest('hex'));
+  assert.match(hashes[file], /^[0-9a-f]{64}$/);
+});
 
 test('failed chunk continuation is permitted only for classified transient metadata exhaustion', () => {
   for (const [category, code] of [['TIMEOUT', 23], ['UNAVAILABLE', 14], ['RESOURCE_EXHAUSTED', 8]] as const) {
@@ -108,6 +119,10 @@ test('checkpoint failures are classified as storage failures and never metadata 
     assert.deepEqual(recorderFailure(new CheckpointQueueError(category), 'stream'),
       { code: null, stage: 'checkpoint', category, retryable: false });
   }
+  assert.deepEqual(recorderFailure(new CheckpointQueueError('CHECKPOINT_UPLOAD_FAILED', {
+    storageStage: 'ASSET_UPLOAD', storageCategory: 'HTTP_TRANSIENT', httpStatus: 503, retryable: true,
+  }), 'stream'), { code: 503, stage: 'checkpoint', category: 'CHECKPOINT_UPLOAD_FAILED', retryable: false,
+    storageStage: 'ASSET_UPLOAD', storageCategory: 'HTTP_TRANSIENT', storageRetryable: true });
 });
 
 test('the capture loop keeps one connection across temporal checkpoints', async () => {

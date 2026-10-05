@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, studyProtocol,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, studyProtocol,
 } from './study-protocol.js';
 
 test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(STUDY_PROTOCOL_HASH, hashStudyValue(studyProtocol));
+  assert.equal(studyProtocol.maxAttemptedJobs, 100);
+  assert.equal(STUDY_60_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 60 }));
   assert.equal(studyProtocol.campaignEnabledByDefault, false);
   assert.deepEqual(studyProtocol.automaticBlockCheck,
     { session: 'main', requiredBeforeChunks: true, failure: 'abort-block', includedInReplay: false });
