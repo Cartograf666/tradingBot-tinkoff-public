@@ -202,6 +202,22 @@ test('a failed previous chunk cannot make the next capture start before its fixe
   assert.ok(Date.now() >= started + 15);
 });
 
+test('an early timer callback cannot admit a block before its absolute boundary', async t => {
+  let now = 1_000;
+  t.mock.method(Date, 'now', () => now);
+  const notBefore = now + 30;
+  const delays: number[] = [];
+  await waitUntil(notBefore, new AbortController().signal, (callback, delay) => {
+    delays.push(delay);
+    return setTimeout(() => {
+      now = delays.length === 1 ? notBefore - 1 : notBefore;
+      callback();
+    }, 0);
+  });
+  assert.deepEqual(delays, [30, 1], 'the early wake must be followed by another wait');
+  assert.equal(Date.now(), notBefore);
+});
+
 test('automatic block capture waits for session start AND the completed smoke/archive check', async () => {
   const calls: string[] = [], notBefore = Date.now() + 20;
   let releaseProbe!: () => void, notifyProbe!: () => void;

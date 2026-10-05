@@ -505,21 +505,30 @@ async function archiveChunk(directory: string, name: string, companion?: string,
     ...(companion ? [path.basename(companion)] : [])], { signal });
   return archive;
 }
-export async function waitUntil(when: number, signal: AbortSignal): Promise<void> {
-  const delay = when - Date.now();
-  if (delay <= 0) return;
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true; clearTimeout(timer); signal.removeEventListener('abort', stop);
-      error ? reject(error) : resolve();
-    };
-    const timer = setTimeout(() => finish(), delay);
-    const stop = () => finish(new Error('Study block aborted'));
-    signal.addEventListener('abort', stop, { once: true });
-    if (signal.aborted) stop();
-  });
+export async function waitUntil(when: number, signal: AbortSignal,
+  schedule: (callback: () => void, delayMs: number) => NodeJS.Timeout = setTimeout): Promise<void> {
+  if (!Number.isFinite(when)) throw new Error('Invalid study block deadline');
+  signal.throwIfAborted();
+  // A timer can wake just before its requested wall-clock deadline. Admission
+  // depends on the absolute time, not on one timer callback having fired.
+  while (Date.now() < when) {
+    const delay = when - Date.now();
+    if (delay <= 0) break;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true; if (timer) clearTimeout(timer); signal.removeEventListener('abort', stop);
+        error ? reject(error) : resolve();
+      };
+      const stop = () => finish(new Error('Study block aborted'));
+      timer = schedule(() => finish(), delay);
+      signal.addEventListener('abort', stop, { once: true });
+      if (signal.aborted) stop();
+    });
+    signal.throwIfAborted();
+  }
 }
 
 /** The probe resolves only after quality, replay and private upload all pass.
