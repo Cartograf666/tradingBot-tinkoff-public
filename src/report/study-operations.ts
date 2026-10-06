@@ -1,4 +1,4 @@
-import { planStudyBlock, type StudyBlockPlan } from '../research/study-protocol.js';
+import { planStudyBlock, STUDY_MAX_ATTEMPTS, STUDY_REQUIRED_DAYS, type StudyBlockPlan } from '../research/study-protocol.js';
 import type { StudyLedger } from '../research/study-state.js';
 import type { StudyRuntimeSnapshot } from './study-runtime.js';
 
@@ -22,6 +22,22 @@ export interface BlockOperation {
 }
 
 type ConfirmedCheckpoint = NonNullable<BlockOperation['checkpoints']>[number];
+
+/** Capacity planning only: unfinished/raw days are never promoted to accepted days. */
+export function studyProgress(ledger: StudyLedger) {
+  const accepted = (phase: 'DEVELOPMENT' | 'HOLDOUT') => new Set(ledger.days
+    .filter(day => day.phase === phase && day.quality?.status === 'PASS').map(day => day.sessionDate)).size;
+  const developmentDays = accepted('DEVELOPMENT'), holdoutDays = accepted('HOLDOUT');
+  const remainingDays = Math.max(0, STUDY_REQUIRED_DAYS - developmentDays)
+    + Math.max(0, STUDY_REQUIRED_DAYS - holdoutDays);
+  const remainingAttempts = Math.max(0, STUDY_MAX_ATTEMPTS - ledger.attempts.length);
+  const blocksForEntirelyNewDays = remainingDays * 2;
+  return { phase: ledger.phase, developmentDays, holdoutDays, requiredDaysPerPhase: STUDY_REQUIRED_DAYS,
+    frozen: ledger.freeze !== null, usedAttempts: ledger.attempts.length, maximumAttempts: STUDY_MAX_ATTEMPTS,
+    remainingAttempts, remainingDays, blocksForEntirelyNewDays,
+    reserveForEntirelyNewDays: remainingAttempts - blocksForEntirelyNewDays,
+    basis: 'Two blocks per entirely new day; pending and partially recorded days are not credited. No failure reserve or profitability inference.' };
+}
 
 /** Checkpoint confirmation times are immutable evidence of each individual upload. */
 export function confirmOperationCheckpoint(operation: BlockOperation, checkpoint: ConfirmedCheckpoint): void {
@@ -116,7 +132,7 @@ export function collectorStatus(operations: BlockOperation[], date: string, now:
     return { ...base, status: 'STARTING' };
   }
   if (runtime.runs.some(run => run.captureCommandRunning)) return { ...base, status: 'DIAGNOSTIC' };
-  if (runtime.runs.some(run => run.captureJobRunning)) return { ...base, status: 'STARTING' };
+  if (runtime.runs.some(run => run.captureJobRunning && !run.preparing)) return { ...base, status: 'STARTING' };
   if (runtime.runs.some(run => run.preparing || run.queued)) return { ...base, status: 'WAITING' };
   if (current[0]?.state === 'PROCESSING') return { ...base, status: 'PROCESSING', reason: 'SCIENTIFIC_PROCESSING_PENDING' };
   return { ...base, status: current[0] && ['STARTING', 'CAPTURING', 'FAILED', 'CANCELLED'].includes(current[0].state) ? 'STOPPED' : 'IDLE' };
@@ -156,6 +172,7 @@ export function operationalDay(ledger: StudyLedger, operations: BlockOperation[]
     : chunks.length || checkpoints.length ? 'PARTIAL_DATA' : 'NO_DATA';
   const missing = unarchivedWindows(ledger, blocks[0]?.plan, date, now);
   return { schemaVersion: 1 as const, sessionDate: date, state, generatedAt: new Date(now).toISOString(),
+    study: studyProgress(ledger),
     collector: collectorStatus(blocks, date, now, runtime),
     unarchivedClosedWindows: missing.count, unarchivedClosedWindowSeconds: missing.seconds,
     fullDayAccepted: accepted?.quality.status === 'PASS', attempts: attempts.length,
@@ -180,6 +197,10 @@ export function renderOperationalDay(day: ReturnType<typeof operationalDay>): st
     PROCESSING: 'Обработка сохранённых результатов',
     DIAGNOSTIC: 'Выполняется диагностическая запись', WAITING: 'Подготовка / ожидание очереди', STOPPED: 'Сбор остановлен', IDLE: 'Активного сбора нет' };
   return `### ${day.sessionDate}: ${labels[day.state]}\n\n`
+    + `Исследование: DEVELOPMENT **${day.study.developmentDays}/${day.study.requiredDaysPerPhase}**, HOLDOUT **${day.study.holdoutDays}/${day.study.requiredDaysPerPhase}**; правила ${day.study.frozen ? 'зафиксированы' : 'ещё не зафиксированы'}.\n\n`
+    + `Попытки за всю кампанию: **${day.study.usedAttempts}/${day.study.maximumAttempts}**, осталось **${day.study.remainingAttempts}**. Для ${day.study.remainingDays} полностью новых дней нужно ${day.study.blocksForEntirelyNewDays} блоков без резерва на сбои. Незавершённые и частичные дни в этом расчёте не зачтены.\n\n`
+    + (day.study.reserveForEntirelyNewDays < 0
+      ? 'Остаток попыток не покрывает все необходимые полностью новые дни; требуется проверить бюджет с учётом результатов незавершённых записей. Лимит автоматически не увеличивается.\n\n' : '')
     + `Сборщик: **${runtimeLabels[day.collector.status]}**. Проверка активности: ${day.collector.checkedAt ?? 'не выполнена'}.\n\n`
     + (day.collector.nextExpectedUploadAt ? `Следующий архив ожидается не позднее ${day.collector.nextExpectedUploadAt} (с учётом времени на подтверждение сохранения).\n\n` : '')
     + `Подтверждено архивов: **${day.confirmedArchives}**. Частей с пройденным качеством: **${day.passingParts}**; отклонённых: **${day.rejectedParts}**.\n\n`

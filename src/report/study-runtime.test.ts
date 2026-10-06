@@ -28,6 +28,18 @@ test('distinguishes capture command from an arm still waiting in prepare', async
   ]);
 });
 
+test('classifies same-campaign credential-free readiness as preparing, not capture', async () => {
+  const runtime = await readStudyRuntime(environment(), fetchQueue([
+    response({ total_count: 1, workflow_runs: [active(8, 'Market study / arm / early')] }),
+    response(emptyRuns()), response(emptyRuns()), response(emptyRuns()), response(emptyRuns()),
+    response({ total_count: 1, jobs: [{ name: 'campaign', status: 'in_progress', steps: [
+      { name: "Wait for today's original block readiness without broker or storage credentials", status: 'in_progress' },
+      { name: 'Verify private destination and capture the owned block', status: 'queued' },
+    ] }] }),
+  ]), 0);
+  assert.deepEqual(runtime.runs.map(run => [run.captureJobRunning, run.captureCommandRunning, run.preparing]), [[true, false, true]]);
+});
+
 test('reports an available empty active set', async () => {
   const runtime = await readStudyRuntime(environment(), fetchQueue([response(emptyRuns()), response(emptyRuns()), response(emptyRuns()), response(emptyRuns()), response(emptyRuns())]), 0);
   assert.deepEqual(runtime, { checkedAt: '1970-01-01T00:00:00.000Z', available: true, reason: null, runs: [] });

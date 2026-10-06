@@ -9,7 +9,7 @@ on:
     - cron: '17 1 * * 1-5'
     - cron: '17,47 5 * * 1-5'
     - cron: '17 6 * * 1-5'
-    # Start runners early; credential-free preparation waits for 08:50/13:50 MSK.
+    # Start runners early; credential-free handoff waits for 08:30/13:30 MSK.
     - cron: '20,35 5 * * 1-5'
     - cron: '20,35 10 * * 1-5'
     - cron: '50,55 5 * * 1-5'
@@ -70,6 +70,8 @@ jobs:
       vars.MARKET_STUDY_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    outputs:
+      session_date: ${{ steps.handoff.outputs.session_date }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -80,10 +82,11 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npx tsc -p tsconfig.study.json
-      - name: Wait for today's block without broker or storage credentials
+      - name: Wait for runner handoff without broker or storage credentials
+        id: handoff
         env:
           STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '17,47 0 * * 1-5' || github.event.schedule == '17 1 * * 1-5' || github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
-        run: node .study-dist/src/report/market-study.js prepare-block --block "$STUDY_BLOCK"
+        run: node .study-dist/src/report/market-study.js prepare-runner-handoff --block "$STUDY_BLOCK"
 
   campaign:
     concurrency:
@@ -109,6 +112,21 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npx tsc -p tsconfig.study.json
+      - name: Wait for today's original block readiness without broker or storage credentials
+        env:
+          STUDY_BLOCK: ${{ github.event_name == 'schedule' && (github.event.schedule == '17,47 0 * * 1-5' || github.event.schedule == '17 1 * * 1-5' || github.event.schedule == '20,35 5 * * 1-5' || github.event.schedule == '50,55 5 * * 1-5' || github.event.schedule == '0,5,10,15 6 * * 1-5') && 'early' || github.event_name == 'schedule' && 'late' || inputs.block }}
+          STUDY_SESSION_DATE: ${{ needs.prepare.outputs.session_date }}
+          STUDY_REQUIRES_HANDOFF: ${{ github.event_name == 'schedule' || inputs.mode == 'arm' }}
+        run: |
+          if [[ "$STUDY_REQUIRES_HANDOFF" == 'true' && -z "$STUDY_SESSION_DATE" ]]; then
+            echo 'Required runner handoff date is missing' >&2
+            exit 1
+          fi
+          if [[ -n "$STUDY_SESSION_DATE" ]]; then
+            node .study-dist/src/report/market-study.js wait-block-readiness --block "$STUDY_BLOCK" --session-date "$STUDY_SESSION_DATE"
+          else
+            node .study-dist/src/report/market-study.js wait-block-readiness --block "$STUDY_BLOCK"
+          fi
       - name: Verify private destination and capture the owned block
         shell: bash
         env:
@@ -127,7 +145,7 @@ jobs:
 
   utility:
     concurrency:
-      group: ${{ (inputs.mode == 'preflight' || inputs.mode == 'smoke' || inputs.mode == 'observe') && 'market-study-capture' || format('market-study-utility-{0}', inputs.mode) }}
+      group: ${{ (inputs.mode == 'preflight' || inputs.mode == 'smoke' || inputs.mode == 'observe' || inputs.mode == 'continuous-pilot') && 'market-study-capture' || format('market-study-utility-{0}', inputs.mode) }}
       cancel-in-progress: false
     if: >-
       github.event.repository.private == false &&

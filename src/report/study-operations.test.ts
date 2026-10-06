@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { closedPlansNeedingFinalization, collectorStatus, confirmOperationCheckpoint, continuousOperationFailureStage, continuousRecordingCompleted,
   markOperationRecordingStopped, mergeBlockOperations, operationalDay, recordOwnedSlot, recoverableRecordingFailure,
-  renderOperationalDay, type BlockOperation } from './study-operations.js';
+  renderOperationalDay, studyProgress, type BlockOperation } from './study-operations.js';
 import { createStudyLedger } from '../research/study-state.js';
 import { planStudyBlock } from '../research/study-protocol.js';
 import type { StudyRuntimeSnapshot } from './study-runtime.js';
@@ -27,6 +27,35 @@ test('missing capture remains an incomplete operational day without accepting sc
 });
 
 const reportDate = '2026-09-17', reportNow = Date.parse(`${reportDate}T12:10:00Z`);
+
+test('progress shows the real remaining budget without crediting partial days or changing the ledger', () => {
+  const ledger = createStudyLedger();
+  ledger.attempts = Array.from({ length: 61 }, (_, index) => ({ attemptId: `${index + 1}:1`,
+    runId: String(index + 1), runAttempt: 1, sessionDate: reportDate, block: 'early',
+    phase: 'DEVELOPMENT', mode: 'COUNTED', startedAt: `${reportDate}T06:00:00Z`, status: 'STARTED' }));
+  const before = JSON.stringify(ledger);
+  const progress = studyProgress(ledger);
+  assert.equal(progress.usedAttempts, 61); assert.equal(progress.remainingAttempts, 39);
+  assert.equal(progress.developmentDays, 0); assert.equal(progress.holdoutDays, 0);
+  assert.equal(progress.blocksForEntirelyNewDays, 40); assert.equal(progress.reserveForEntirelyNewDays, -1);
+  assert.equal(progress.frozen, false);
+  const text = renderOperationalDay(operationalDay(ledger, [], reportDate, reportNow));
+  assert.match(text, /61\/100/); assert.match(text, /полностью новых дней/);
+  assert.match(text, /Лимит автоматически не увеличивается/);
+  assert.equal(JSON.stringify(ledger), before);
+});
+
+test('progress counts distinct accepted dates per phase and never treats rejected days as progress', () => {
+  const ledger = createStudyLedger();
+  const day = (sessionDate: string, phase: 'DEVELOPMENT' | 'HOLDOUT', status: 'PASS' | 'INSUFFICIENT_DATA') =>
+    ({ sessionDate, phase, quality: { status } }) as typeof ledger.days[number];
+  ledger.days = [day('2026-09-15', 'DEVELOPMENT', 'PASS'), day('2026-09-15', 'DEVELOPMENT', 'PASS'),
+    day('2026-09-16', 'DEVELOPMENT', 'INSUFFICIENT_DATA'), day('2026-10-01', 'HOLDOUT', 'PASS')];
+  const progress = studyProgress(ledger);
+  assert.equal(progress.developmentDays, 1); assert.equal(progress.holdoutDays, 1);
+  assert.equal(progress.remainingDays, 18); assert.equal(progress.blocksForEntirelyNewDays, 36);
+  assert.equal(progress.frozen, false, 'receipt counts do not fabricate a freeze');
+});
 function operation(state: BlockOperation['state'] = 'CAPTURING'): BlockOperation {
   const plan = planStudyBlock(reportDate, `${reportDate}T06:00:00Z`, `${reportDate}T15:54:59Z`, 'late', Date.parse(`${reportDate}T10:50:00Z`))!;
   return { schemaVersion: 1, attemptId: '123:1', plan, state, failure: null, parts: [],
@@ -51,6 +80,8 @@ test('stored capture state never substitutes for fresh GitHub liveness evidence'
 test('runtime separates waiting, startup and diagnostic commands from canonical capture', () => {
   const status = (run: StudyRuntimeSnapshot['runs'][number], op: BlockOperation = operation()) => collectorStatus([op], reportDate, reportNow, runtime([run])).status;
   assert.equal(status({ ...activeRun, captureCommandRunning: false, captureJobRunning: false, preparing: true }), 'WAITING');
+  assert.equal(status({ ...activeRun, captureCommandRunning: false, captureJobRunning: true, preparing: true }), 'WAITING',
+    'a reserved campaign worker waiting without credentials is not an active collector');
   assert.equal(status({ ...activeRun, captureCommandRunning: false, captureJobRunning: false, queued: true }), 'WAITING');
   assert.equal(status({ ...activeRun, captureCommandRunning: false }), 'STARTING');
   assert.equal(status(activeRun, operation('STARTING')), 'STARTING');

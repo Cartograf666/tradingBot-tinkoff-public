@@ -77,9 +77,28 @@ function utcForMoscowDate(date: string, hour: number, minute: number): number {
 
 /** Manual preparation must be upcoming; delayed schedules defer admission to planStudyBlock. */
 export function planStudyPreparation(block: StudyBlock, nowMs: number, source: 'manual' | 'schedule' = 'manual'): { sessionDate: string; readyAt: string } {
+  return planPreparationTime(block, nowMs, source, 50);
+}
+
+/** Operational runner handoff precedes the unchanged scientific preparation time. */
+export function planStudyRunnerHandoff(block: StudyBlock, nowMs: number, source: 'manual' | 'schedule' = 'manual'): { sessionDate: string; readyAt: string } {
+  // An arm started after handoff but before readiness was valid before this split.
+  if (source === 'manual') planStudyPreparation(block, nowMs, 'manual');
+  return planPreparationTime(block, nowMs, 'schedule', 30);
+}
+
+/** A campaign runner may wait at most the handoff-to-readiness interval before capture work. */
+export function planStudyCampaignReadiness(block: StudyBlock, nowMs: number): { sessionDate: string; readyAt: string } {
+  const readiness = planStudyPreparation(block, nowMs, 'schedule');
+  const handoff = planStudyRunnerHandoff(block, nowMs, 'schedule');
+  if (nowMs < Date.parse(handoff.readyAt)) throw new Error('Campaign runner started before operational handoff');
+  return readiness;
+}
+
+function planPreparationTime(block: StudyBlock, nowMs: number, source: 'manual' | 'schedule', minute: number): { sessionDate: string; readyAt: string } {
   if (!['early', 'late'].includes(block) || !Number.isFinite(nowMs)) throw new Error('Invalid preparation request');
   const sessionDate = new Date(nowMs + 3 * 3_600_000).toISOString().slice(0, 10);
-  const target = utcForMoscowDate(sessionDate, block === 'early' ? 8 : 13, 50);
+  const target = utcForMoscowDate(sessionDate, block === 'early' ? 8 : 13, minute);
   const delay = target - nowMs;
   if ((delay <= 0 && source !== 'schedule') || delay >= STUDY_JOB_MAX_MS - 120_000) throw new Error('Preparation must be later today and within the bounded job duration');
   return { sessionDate, readyAt: new Date(target).toISOString() };

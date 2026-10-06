@@ -272,6 +272,9 @@ test('README performance aggregate excludes finalized days that failed the quali
   const markdown = ledgerReadme(ledger, 'owner/private');
   assert.match(markdown, /\| DEVELOPMENT \| baseline \| 1 \| 2 \| 4\.00 \| 3\.00 \| 0 \|/);
   assert.match(markdown, /Rejected finalized days: 1/);
+  assert.match(markdown, /Attempts: 0\/100; remaining: 100/);
+  assert.match(markdown, /Entirely new days remaining: 19; blocks needed: 38; attempt reserve: 62/);
+  assert.match(markdown, /Pending and partially recorded days are not credited/);
   assert.doesNotMatch(markdown, /1000\.00/);
 });
 
@@ -324,6 +327,25 @@ test('every retry schedule and manual capture map to the same block and concurre
   assert.equal(evaluate(groupExpression, 'workflow_dispatch', '', 'observe', 'early'), 'observe');
 });
 
+test('handoff precedes same-runner credential-free readiness and preserves date and original clock', () => {
+  const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
+  const prepare = workflow.split('  prepare:')[1].split('  campaign:')[0];
+  const campaign = workflow.split('  campaign:')[1].split('  utility:')[0];
+  assert.match(prepare, /session_date: \$\{\{ steps\.handoff\.outputs\.session_date \}\}/);
+  assert.match(prepare, /prepare-runner-handoff --block "\$STUDY_BLOCK"/);
+  assert.doesNotMatch(prepare, /secrets\.|market-study-capture/);
+  const readiness = campaign.indexOf("Wait for today's original block readiness without broker or storage credentials");
+  const capture = campaign.indexOf('Verify private destination and capture the owned block');
+  assert.ok(readiness > campaign.indexOf('npx tsc -p tsconfig.study.json') && capture > readiness);
+  assert.match(campaign, /STUDY_SESSION_DATE: \$\{\{ needs\.prepare\.outputs\.session_date \}\}/);
+  assert.match(campaign, /STUDY_REQUIRES_HANDOFF: \$\{\{ github\.event_name == 'schedule' \|\| inputs\.mode == 'arm' \}\}/);
+  assert.match(campaign, /wait-block-readiness --block "\$STUDY_BLOCK" --session-date "\$STUDY_SESSION_DATE"/);
+  assert.doesNotMatch(campaign.slice(readiness, capture), /secrets\.|TINKOFF_API_TOKEN_SANDBOX|MARKET_STUDY_STORAGE_TOKEN/);
+  const source = readFileSync(path.resolve('src/report/market-study.ts'), 'utf8');
+  assert.match(source, /expectedSessionDate !== preparation\.sessionDate\) throw new Error\('Runner handoff crossed its study date'\)/);
+  assert.match(source, /command === 'prepare-runner-handoff'\) output\('session_date', preparation\.sessionDate\)/);
+});
+
 test('prepared capture cannot run after preparation fails or is cancelled, while regular capture tolerates skipped preparation', () => {
   const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
   const expression = /  campaign:\n[\s\S]*?    needs: prepare\n    if: >-\n([\s\S]*?)    runs-on:/.exec(workflow)![1].trim();
@@ -354,7 +376,7 @@ test('workflow keeps schedules activation-gated and action versions immutable', 
   assert.doesNotMatch(workflow, /TINKOFF_API_TOKEN_PROD/);
 });
 
-test('primary market commands share one capture lock; bounded pilot has its own lock', () => {
+test('every market capture mode shares one capture lock', () => {
   const workflow = readFileSync(path.resolve('.github/workflows/market-study.yml'), 'utf8');
   const campaign = workflow.split('  campaign:')[1].split('  utility:')[0];
   const utility = workflow.split('  utility:')[1];
@@ -363,8 +385,7 @@ test('primary market commands share one capture lock; bounded pilot has its own 
   const expression = /group: \$\{\{ (.*?) \}\}/.exec(utility)![1];
   const group = (mode: string) => Function('inputs', 'format', `return (${expression});`)(
     { mode }, (_: string, value: string) => `market-study-utility-${value}`);
-  for (const mode of ['preflight', 'smoke', 'observe']) assert.equal(group(mode), 'market-study-capture');
-  assert.equal(group('continuous-pilot'), 'market-study-utility-continuous-pilot');
+  for (const mode of ['preflight', 'smoke', 'observe', 'continuous-pilot']) assert.equal(group(mode), 'market-study-capture');
   for (const mode of ['report', 'status', 'freeze']) assert.notEqual(group(mode), 'market-study-capture');
   assert.doesNotMatch(workflow.split('  prepare:')[1].split('  campaign:')[0], /market-study-capture|secrets\./);
   const reports = readFileSync(path.resolve('.github/workflows/study-report.yml'), 'utf8');

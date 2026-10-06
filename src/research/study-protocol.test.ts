@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, studyProtocol,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, planStudyRunnerHandoff, planStudyCampaignReadiness, studyProtocol,
 } from './study-protocol.js';
 
 test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(STUDY_PROTOCOL_HASH, hashStudyValue(studyProtocol));
+  assert.equal(STUDY_PROTOCOL_HASH, '0f646c1ed3a56ee9dacc43af6ddaaebb1df4003dadb6c24701cd86203412d98e');
   assert.equal(studyProtocol.maxAttemptedJobs, 100);
   assert.equal(STUDY_60_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 60 }));
   assert.equal(studyProtocol.campaignEnabledByDefault, false);
@@ -15,6 +16,40 @@ test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(studyProtocol.blocks.early.owns, '[API main start, 14:00 Europe/Moscow)');
   assert.equal(studyProtocol.blocks.late.owns, '[14:00 Europe/Moscow, API main end)');
   assert.notEqual(hashStudyValue({ ...studyProtocol, depth: 10 }), STUDY_PROTOCOL_HASH);
+});
+
+test('runner handoff leaves twenty minutes for setup without changing the scientific readiness clock', () => {
+  const day = '2026-09-15';
+  for (const [block, hour] of [['early', '05'], ['late', '10']] as const) {
+    const launched = Date.parse(`${day}T${hour}:17:00Z`);
+    const handoff = planStudyRunnerHandoff(block, launched, 'schedule');
+    const readiness = planStudyPreparation(block, Date.parse(handoff.readyAt), 'schedule');
+    assert.deepEqual(handoff, { sessionDate: day, readyAt: `${day}T${hour}:30:00.000Z` });
+    assert.deepEqual(readiness, { sessionDate: day, readyAt: `${day}T${hour}:50:00.000Z` });
+    assert.equal(Date.parse(readiness.readyAt) - Date.parse(handoff.readyAt), 20 * 60_000);
+    assert.doesNotThrow(() => assertStudyPreparationReady(handoff, Date.parse(handoff.readyAt)));
+    assert.throws(() => assertStudyPreparationReady(handoff, Date.parse(`${day}T${hour}:29:59Z`)));
+    assert.throws(() => assertStudyPreparationReady(handoff, Date.parse('2026-09-15T21:00:00Z')));
+    assert.deepEqual(planStudyRunnerHandoff(block, Date.parse(`${day}T${hour}:40:00Z`)), handoff,
+      'manual arm after handoff remains eligible while original readiness is upcoming');
+    assert.throws(() => planStudyRunnerHandoff(block, Date.parse(`${day}T${hour}:50:00Z`)), /later today/);
+    assert.deepEqual(planStudyRunnerHandoff(block, Date.parse(`${day}T${hour}:35:00Z`), 'schedule'), handoff);
+  }
+  assert.throws(() => planStudyRunnerHandoff('late', Date.parse(`${day}T00:00:00Z`), 'schedule'), /bounded job duration/);
+  assert.throws(() => planStudyRunnerHandoff('early', NaN), /Invalid preparation request/);
+});
+
+test('campaign waits only after handoff and permits delayed manual starts without another runner', () => {
+  const day = '2026-09-15';
+  for (const [block, hour] of [['early', '05'], ['late', '10']] as const) {
+    assert.throws(() => planStudyCampaignReadiness(block, Date.parse(`${day}T${hour}:17:00Z`)), /before operational handoff/);
+    assert.throws(() => planStudyCampaignReadiness(block, Date.parse(`${day}T${hour}:29:59.999Z`)), /before operational handoff/);
+    for (const minute of ['30', '40', '50', '55']) {
+      assert.deepEqual(planStudyCampaignReadiness(block, Date.parse(`${day}T${hour}:${minute}:00Z`)),
+        { sessionDate: day, readyAt: `${day}T${hour}:50:00.000Z` });
+    }
+  }
+  assert.throws(() => planStudyCampaignReadiness('late', NaN), /Invalid preparation request/);
 });
 
 test('armed preparation waits for today only within a bounded runner duration', () => {

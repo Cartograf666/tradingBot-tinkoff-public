@@ -13,7 +13,7 @@ import { confirmFamilyAsset, familyInventory, parsePhysicalReleases, type Physic
 import { CheckpointStorageFailure, checkpointStorageStep } from './checkpoint-diagnostic.js';
 import { recordMarket, type RecorderArguments } from './record-market.js';
 import { closedPlansNeedingFinalization, confirmOperationCheckpoint, continuousOperationFailureStage, continuousRecordingCompleted, markOperationRecordingStopped,
-  mergeBlockOperations, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, type BlockOperation } from './study-operations.js';
+  mergeBlockOperations, operationalDay, renderOperationalDay, recoverableRecordingFailure, recordOwnedSlot, studyProgress, type BlockOperation } from './study-operations.js';
 import { readStudyRuntime } from './study-runtime.js';
 import { fixedReplayScenarios, replayConfigHash, replayRecording, replaySession, replaySourceHashes } from './replay-orderbook.js';
 import { checkRecordedReplayCompatibility } from './replay-compatibility.js';
@@ -23,7 +23,7 @@ import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
 import {
-  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, planStudyRunnerHandoff, planStudyCampaignReadiness,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
@@ -126,8 +126,7 @@ async function putRemoteFile(repository: string, file: string, content: string, 
   finally { unlinkSync(payload); }
 }
 export function ledgerReadme(ledger: StudyLedger, repository: string): string {
-  const development = new Set(ledger.days.filter(day => day.phase === 'DEVELOPMENT' && day.quality.status === 'PASS').map(day => day.sessionDate));
-  const holdout = new Set(ledger.days.filter(day => day.phase === 'HOLDOUT' && day.quality.status === 'PASS').map(day => day.sessionDate));
+  const progress = studyProgress(ledger);
   const rejected = ledger.days.filter(day => day.quality.status === 'INSUFFICIENT_DATA').length;
   const aggregates = new Map<string, { phase: string; scenario: string; days: number; entries: number; fees: number;
     unresolved: number; net: number; netKnown: boolean }>();
@@ -144,7 +143,7 @@ export function ledgerReadme(ledger: StudyLedger, repository: string): string {
   }
   const rows = [...aggregates.values()].map(item => `| ${item.phase} | ${item.scenario} | ${item.days} | ${item.entries} | ${item.netKnown ? item.net.toFixed(2) : '—'} | ${item.fees.toFixed(2)} | ${item.unresolved} |`).join('\n');
   const table = rows ? `\n| Phase | Scenario | Days | Entries | Net PnL, RUB | Fees, RUB | Unresolved |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n${rows}\n` : '';
-  return `# Market study state\n\n- Phase: **${ledger.phase}**\n- Protocol: \`${ledger.protocolHash}\`\n- Development days: ${development.size}/10\n- Holdout days: ${holdout.size}/10\n- Rejected finalized days: ${rejected}\n- Attempts: ${ledger.attempts.length}/${STUDY_MAX_ATTEMPTS}\n- Confirmed immutable chunks: ${ledger.chunks.length}\n- Archive: [private draft release](https://github.com/${repository}/releases/tag/${STUDY_RELEASE_TAG})\n- Updated: ${ledger.updatedAt}\n${table}\nQuality acceptance is independent of replay PnL. The table includes passing days only, is descriptive, and never selects a winner. Raw recordings are release assets, never Git blobs.\n`;
+  return `# Market study state\n\n- Phase: **${ledger.phase}**\n- Protocol: \`${ledger.protocolHash}\`\n- Development days: ${progress.developmentDays}/${progress.requiredDaysPerPhase}\n- Holdout days: ${progress.holdoutDays}/${progress.requiredDaysPerPhase}\n- Rejected finalized days: ${rejected}\n- Attempts: ${progress.usedAttempts}/${progress.maximumAttempts}; remaining: ${progress.remainingAttempts}\n- Entirely new days remaining: ${progress.remainingDays}; blocks needed: ${progress.blocksForEntirelyNewDays}; attempt reserve: ${progress.reserveForEntirelyNewDays}\n- Confirmed immutable chunks: ${ledger.chunks.length}\n- Archive: [private draft release](https://github.com/${repository}/releases/tag/${STUDY_RELEASE_TAG})\n- Updated: ${ledger.updatedAt}\n${table}\nPending and partially recorded days are not credited in the new-day capacity estimate. It has no failure reserve and makes no profitability claim or budget authorization. Quality acceptance is independent of replay PnL. The table includes passing days only, is descriptive, and never selects a winner. Raw recordings are release assets, never Git blobs.\n`;
 }
 /** One compare-and-swap commit keeps the receipt and ledger transition indivisible. */
 export async function migrateRemoteStudyAttemptBudget(repository: string, signal?: AbortSignal): Promise<StudyLedger> {
@@ -1623,15 +1622,24 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const controller = new AbortController(), stop = () => controller.abort();
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   try {
-    if (command === 'prepare-block') {
+    if (command === 'prepare-block' || command === 'prepare-runner-handoff' || command === 'wait-block-readiness') {
       const block = required(values, '--block');
-      const preparation = planStudyPreparation(block as StudyBlock, Date.now(),
-        process.env.GITHUB_EVENT_NAME === 'schedule' ? 'schedule' : 'manual');
-      console.log(JSON.stringify({ action: 'WAITING_FOR_BLOCK', block, ...preparation }));
+      const source = command === 'wait-block-readiness' || process.env.GITHUB_EVENT_NAME === 'schedule' ? 'schedule' : 'manual';
+      const preparation = command === 'prepare-runner-handoff'
+        ? planStudyRunnerHandoff(block as StudyBlock, Date.now(), source)
+        : command === 'wait-block-readiness'
+          ? planStudyCampaignReadiness(block as StudyBlock, Date.now())
+        : planStudyPreparation(block as StudyBlock, Date.now(), source);
+      const expectedSessionDate = values.get('--session-date');
+      if (command === 'wait-block-readiness' && expectedSessionDate !== undefined
+        && expectedSessionDate !== preparation.sessionDate) throw new Error('Runner handoff crossed its study date');
+      const action = command === 'prepare-runner-handoff' ? 'RUNNER_HANDOFF' : 'BLOCK_READINESS';
+      console.log(JSON.stringify({ action: command === 'prepare-block' ? 'WAITING_FOR_BLOCK' : `WAITING_FOR_${action}`, block, ...preparation }));
       await waitUntil(Date.parse(preparation.readyAt), controller.signal);
       controller.signal.throwIfAborted();
       assertStudyPreparationReady(preparation, Date.now());
-      console.log(JSON.stringify({ action: 'PREPARATION_COMPLETE', block, ...preparation }));
+      if (command === 'prepare-runner-handoff') output('session_date', preparation.sessionDate);
+      console.log(JSON.stringify({ action: command === 'prepare-block' ? 'PREPARATION_COMPLETE' : `${action}_COMPLETE`, block, ...preparation }));
       return;
     }
     if (command === 'preflight') {
@@ -1669,11 +1677,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (command === 'status') {
       const ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value;
       assertStudyLedgerProtocol(ledger);
+      const progress = studyProgress(ledger);
       console.log(JSON.stringify({ phase: ledger.phase, attempts: ledger.attempts.length, chunks: ledger.chunks.length,
         completedDayReports: ledger.days.length,
-        acceptedDevelopmentDays: new Set(ledger.days.filter(day => day.phase === 'DEVELOPMENT' && day.quality.status === 'PASS').map(day => day.sessionDate)).size,
-        acceptedHoldoutDays: new Set(ledger.days.filter(day => day.phase === 'HOLDOUT' && day.quality.status === 'PASS').map(day => day.sessionDate)).size,
-        rejectedDayReports: ledger.days.filter(day => day.quality.status !== 'PASS').length })); return;
+        acceptedDevelopmentDays: progress.developmentDays,
+        acceptedHoldoutDays: progress.holdoutDays,
+        rejectedDayReports: ledger.days.filter(day => day.quality.status !== 'PASS').length,
+        study: progress })); return;
     }
     if (command === 'migrate-attempt-budget') {
       const ledger = await migrateRemoteStudyAttemptBudget(repository, controller.signal);
@@ -1701,7 +1711,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       }
       console.log(JSON.stringify(result)); return;
     }
-    throw new Error('Expected prepare-block, preflight, smoke, observe, continuous-pilot, startup-storage-probe, run-block, freeze, report, research, status, or migrate-attempt-budget command');
+    throw new Error('Expected prepare-block, prepare-runner-handoff, wait-block-readiness, preflight, smoke, observe, continuous-pilot, startup-storage-probe, run-block, freeze, report, research, status, or migrate-attempt-budget command');
   } finally {
     controller.abort(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }

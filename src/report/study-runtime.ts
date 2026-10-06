@@ -34,6 +34,7 @@ const captureStepNames = new Set([
   'Verify private destination and capture the owned block',
   'Verify sandbox access or run market smoke with private archive',
 ]);
+const campaignReadinessStep = "Wait for today's original block readiness without broker or storage credentials";
 
 function snapshot(now: number, available: boolean, reason: string | null,
   runs: StudyRuntimeSnapshot['runs'] = []): StudyRuntimeSnapshot {
@@ -103,7 +104,9 @@ function classify(run: WorkflowRun, jobs: Job[] | null): StudyRuntimeSnapshot['r
   const match = titlePattern.exec(run.display_title)!;
   const mode = match[1] as StudyRuntimeMode;
   const queued = waitingStatuses.has(run.status) || Boolean(jobs?.some(job => waitingStatuses.has(job.status)));
-  const preparing = jobs?.some(job => job.name === 'prepare' && job.status === 'in_progress') ?? false;
+  const preparing = jobs?.some(job => job.name === 'prepare' && job.status === 'in_progress'
+    || job.name === 'campaign' && job.status === 'in_progress'
+      && job.steps?.some(step => step.name === campaignReadinessStep && step.status === 'in_progress')) ?? false;
   const captureName = mode === 'campaign' || mode === 'arm' ? 'campaign' : 'utility';
   const capture = jobs?.find(job => job.name === captureName) ?? null;
   const captureJobRunning = capture?.status === 'in_progress';
