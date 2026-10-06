@@ -36,7 +36,7 @@ export const studyProtocol = {
   jobMaxMinutes: STUDY_JOB_MAX_MS / 60_000,
   requiredDaysPerPhase: STUDY_REQUIRED_DAYS, maxAttemptedJobs: STUDY_MAX_ATTEMPTS,
   archive: { kind: 'private-draft-github-release', tag: STUDY_RELEASE_TAG, immutableAssets: true },
-  quality: { minimumDailyTimerCoverage: 0.99, minimumDailyPerInstrumentCoverage: 0.8 },
+  quality: { minimumDailyTimerCoverage: 0.8, minimumDailyPerInstrumentCoverage: 0.8 },
   phases: ['DEVELOPMENT', 'READY_TO_FREEZE', 'HOLDOUT', 'COMPLETE'],
 } as const;
 

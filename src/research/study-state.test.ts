@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acceptStudyChunk, acceptStudyDay, beginStudyAttempt, createStudyLedger, freezeStudy,
-  mergeStudyLedgers, migrateStudyAttemptBudget, extendStudyAttemptBudget, planStudyRun, type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger,
+  mergeStudyLedgers, migrateStudyAttemptBudget, extendStudyAttemptBudget, planStudyRun, dailyQualityThresholds, type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger,
 } from './study-state.js';
 import { hashStudyValue, planStudyBlock, STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH } from './study-protocol.js';
 import { selectStudyDayInputs, studyDayInputHash } from './study-day-inputs.js';
@@ -62,6 +62,29 @@ function addDay(ledger: StudyLedger, date: string, base: number): StudyLedger {
   const next = prepareDay(ledger, date, base);
   return acceptStudyDay(next, dayReceipt(next, date, base));
 }
+
+test('daily gate uses 80/80 only for the new protocol; historical 99/80 receipts stay historical', () => {
+  assert.deepEqual(dailyQualityThresholds(STUDY_PROTOCOL_HASH), { timer: .8, perInstrument: .8 });
+  assert.deepEqual(dailyQualityThresholds(STUDY_100_ATTEMPT_PROTOCOL_HASH), { timer: .99, perInstrument: .8 });
+  assert.deepEqual(dailyQualityThresholds(STUDY_60_ATTEMPT_PROTOCOL_HASH), { timer: .99, perInstrument: .8 });
+  assert.throws(() => dailyQualityThresholds(hex('9')), /Unknown/);
+  const prepared = prepareDay(createStudyLedger(), '2026-09-14', 1);
+  const atBoundary = dayReceipt(prepared, '2026-09-14', 1);
+  atBoundary.quality = { ...atBoundary.quality, recordedShare: .8, observedTicks: 28_560,
+    thresholds: { timer: .8, perInstrument: .8 },
+    perInstrument: atBoundary.quality.perInstrument.map(item => ({ ...item, usableShare: .8 })) };
+  assert.equal(acceptStudyDay(prepared, atBoundary).days[0]?.quality.status, 'PASS');
+  assert.throws(() => acceptStudyDay(prepared, { ...atBoundary, quality: { ...atBoundary.quality,
+    recordedShare: .799, observedTicks: 28_524 } }), /contradicts thresholds/);
+  assert.throws(() => acceptStudyDay(prepared, { ...atBoundary, quality: { ...atBoundary.quality,
+    perInstrument: atBoundary.quality.perInstrument.map((item, index) => index ? item : { ...item, usableShare: .799 }) } }), /contradicts thresholds/);
+  const old = { ...atBoundary, protocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH,
+    dayId: `${STUDY_100_ATTEMPT_PROTOCOL_HASH}:2026-09-14`,
+    quality: { ...atBoundary.quality, thresholds: { timer: .99, perInstrument: .8 } } };
+  assert.throws(() => acceptStudyDay(prepared, old), /contradicts thresholds/);
+  assert.throws(() => acceptStudyDay(prepared, { ...old, quality: { ...old.quality,
+    status: 'INSUFFICIENT_DATA' } }), /retired study protocol/);
+});
 
 test('campaign is configuration-paused while smoke remains available and does not count a day', () => {
   const ledger = createStudyLedger();
@@ -173,15 +196,18 @@ function hundredPredecessor(): StudyLedger {
   ledger.chunks.push(...day.chunks.map(receipt => ({ ...receipt, protocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH })));
   Object.assign(ledger.canonicalChunks, day.canonicalChunks);
   ledger.days.push({ ...day.days[0]!, protocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH,
-    dayId: `${STUDY_100_ATTEMPT_PROTOCOL_HASH}:2026-09-15` });
+    dayId: `${STUDY_100_ATTEMPT_PROTOCOL_HASH}:2026-09-15`,
+    quality: { ...day.days[0]!.quality, status: 'INSUFFICIENT_DATA', recordedShare: .98, observedTicks: 34_986 } });
   return ledger;
 }
 
-test('100-to-120 extension preserves the original migration, receipts and already accepted day', () => {
+test('100/99-to-120/80 extension preserves the original migration, receipts and rejected day', () => {
   const old = hundredPredecessor(), original = structuredClone(old);
   const extended = extendStudyAttemptBudget(old, '2026-10-06T10:00:00.000Z');
   assert.deepEqual(old, original);
   assert.equal(extended.attemptBudgetExtension?.sourceLedgerHash, hashStudyValue(old));
+  assert.deepEqual(extended.attemptBudgetExtension?.qualityChange,
+    { fromDailyTimerCoverage: .99, toDailyTimerCoverage: .8, perInstrumentCoverage: .8 });
   assert.deepEqual(extended.attemptBudgetMigration, old.attemptBudgetMigration);
   assert.deepEqual(extended.attempts, old.attempts);
   assert.deepEqual(extended.chunks, old.chunks);
@@ -194,7 +220,8 @@ test('100-to-120 extension preserves the original migration, receipts and alread
     assetName: 'new-for-old-attempt.tar.gz', protocolHash: STUDY_PROTOCOL_HASH }), /Pre-extension attempt/);
   assert.deepEqual(acceptStudyChunk(extended, old.chunks.at(-1)!), extended);
   assert.throws(() => acceptStudyDay(extended, { ...old.days[0]!, protocolHash: STUDY_PROTOCOL_HASH,
-    dayId: `${STUDY_PROTOCOL_HASH}:2026-09-15`, reportAssetId: 88888 }), /Pre-extension study date/);
+    dayId: `${STUDY_PROTOCOL_HASH}:2026-09-15`, reportAssetId: 88888,
+    quality: { ...old.days[0]!.quality, status: 'PASS' } }), /Pre-extension study date/);
 });
 
 test('new 120-era receipt merges beside a finalized 100-era day without rewriting its science', () => {
@@ -222,6 +249,12 @@ test('extension rejects historical tampering and protects its attempt ceiling un
   tamper(ledger => { ledger.days[0]!.reportArchiveSha256 = hex('9'); });
   tamper(ledger => { ledger.attemptBudgetMigration!.sourceLedgerHash = hex('9'); });
   tamper(ledger => { ledger.attemptBudgetExtension!.oldChunkCount -= 1; });
+  tamper(ledger => { ledger.attemptBudgetExtension!.qualityChange.toDailyTimerCoverage = .99 as .8; });
+  tamper(ledger => { Object.assign(ledger.attemptBudgetExtension!.qualityChange, { alternateCoverage: .99 }); });
+  const acceptedOldDay = hundredPredecessor();
+  acceptedOldDay.days[0]!.quality = { ...acceptedOldDay.days[0]!.quality, status: 'PASS', recordedShare: .995 };
+  assert.throws(() => extendStudyAttemptBudget(acceptedOldDay, '2026-10-06T10:00:00Z'), /authorized/);
+  assert.throws(() => extendStudyAttemptBudget({ ...original, phase: 'READY_TO_FREEZE' }, '2026-10-06T10:00:00Z'), /authorized/);
   assert.throws(() => extendStudyAttemptBudget({ ...original, freeze: {
     frozenAt: '2026-10-06T10:00:00Z', holdoutNotBeforeDate: '2026-10-07', protocolHash: original.protocolHash,
     replayConfigHash: hex('a'), simulatorHashes: { simulator: hex('b') }, developmentDates: [],

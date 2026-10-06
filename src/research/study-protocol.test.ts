@@ -6,10 +6,12 @@ import {
 
 test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(STUDY_PROTOCOL_HASH, hashStudyValue(studyProtocol));
-  assert.equal(STUDY_PROTOCOL_HASH, '6cd4975346001250f72074025018a31328347c41e03061e1cf3d656a73524bbd');
+  assert.equal(STUDY_PROTOCOL_HASH, 'ce196f9722d20e4b7fa25268d0ba13348af13768e0aed24b59ff3bd31f19b421');
   assert.equal(studyProtocol.maxAttemptedJobs, 120);
-  assert.equal(STUDY_100_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 100 }));
-  assert.equal(STUDY_60_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 60 }));
+  const oldQuality = { ...studyProtocol.quality, minimumDailyTimerCoverage: .99 };
+  assert.equal(STUDY_100_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 100, quality: oldQuality }));
+  assert.equal(STUDY_60_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 60, quality: oldQuality }));
+  assert.deepEqual(studyProtocol.quality, { minimumDailyTimerCoverage: .8, minimumDailyPerInstrumentCoverage: .8 });
   assert.equal(studyProtocol.campaignEnabledByDefault, false);
   assert.deepEqual(studyProtocol.automaticBlockCheck,
     { session: 'main', requiredBeforeChunks: true, failure: 'abort-block', includedInReplay: false });

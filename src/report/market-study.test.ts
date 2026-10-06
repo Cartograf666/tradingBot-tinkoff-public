@@ -41,7 +41,7 @@ test('private research publication repairs an interrupted write and publishes it
     diagnosticOnly: true, counted: false, formalHoldout: false, sessionDate: '2026-09-17', fullDayAccepted: false,
     session: { date: '2026-09-17', phase: 'DEVELOPMENT', mainStart: '2026-09-17T06:00:00Z', mainEnd: '2026-09-17T15:55:00Z' },
     inputs: [], replay: { quality: { status: 'INSUFFICIENT_DATA', recordedShare: .1,
-      expectedTicks: 10, observedTicks: 1, perInstrument: [] }, results: [],
+      expectedTicks: 10, observedTicks: 1, perInstrument: [], thresholds: { timer: .8, perInstrument: .8 } }, results: [],
       dataset: { scope: 'session', sessionDate: '2026-09-17', mainStart: '2026-09-17T06:00:00Z',
         mainEnd: '2026-09-17T15:55:00Z', datasetHash: 'd'.repeat(64), inputs: [], mappings: [] },
       fixedScenarios: [], configHash: 'b'.repeat(64), simulatorHashes: {}, runtimeHashes: {}, limitations: [] }, reportVersionHash: 'c'.repeat(64),

@@ -1,6 +1,6 @@
 import {
   STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_REQUIRED_DAYS,
-  STUDY_TICKERS, hashStudyValue, type StudyBlock,
+  STUDY_TICKERS, studyProtocol, hashStudyValue, type StudyBlock,
 } from './study-protocol.js';
 import { expectedStudyDayChunks, selectStudyDayInputs, studyDayInputHash } from './study-day-inputs.js';
 
@@ -48,6 +48,7 @@ export interface DailyStudyQuality {
   expectedTicks: number;
   observedTicks: number;
   perInstrument: Array<{ ticker: string; usableShare: number }>;
+  thresholds?: { timer: number; perInstrument: number };
 }
 export interface StudyDayReceipt {
   schemaVersion: 1;
@@ -112,6 +113,7 @@ export interface StudyAttemptBudgetExtension {
   toProtocolHash: typeof STUDY_PROTOCOL_HASH;
   fromLimit: 100;
   toLimit: 120;
+  qualityChange: { fromDailyTimerCoverage: 0.99; toDailyTimerCoverage: 0.8; perInstrumentCoverage: 0.8 };
   sourceLedgerHash: string;
   migratedAt: string;
   oldAttemptCount: number;
@@ -155,6 +157,8 @@ export function assertStudyLedgerProtocol(ledger: StudyLedger): void {
   assert100AttemptHistory(ledger, extension);
   if (extension.fromProtocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH || extension.toProtocolHash !== STUDY_PROTOCOL_HASH
     || extension.fromLimit !== 100 || extension.toLimit !== 120
+    || !extension.qualityChange || hashStudyValue(extension.qualityChange) !== hashStudyValue({ fromDailyTimerCoverage: .99,
+      toDailyTimerCoverage: .8, perInstrumentCoverage: .8 })
     || !hash.test(extension.sourceLedgerHash) || !Number.isFinite(Date.parse(extension.migratedAt))
     || !Number.isSafeInteger(extension.oldAttemptCount) || extension.oldAttemptCount < 0 || extension.oldAttemptCount > 100
     || !Number.isSafeInteger(extension.oldChunkCount) || extension.oldChunkCount < 0
@@ -238,7 +242,7 @@ export function migrateStudyAttemptBudget(ledger: StudyLedger, migratedAt: strin
   return next;
 }
 
-/** Explicit 100-to-120 transition; all 100-era receipts and the original migration stay unchanged. */
+/** Explicit joint 100/99-to-120/80 transition; historical receipts and migration stay unchanged. */
 export function extendStudyAttemptBudget(ledger: StudyLedger, migratedAt: string): StudyLedger {
   if (ledger.protocolHash === STUDY_PROTOCOL_HASH) {
     assertStudyLedgerProtocol(ledger);
@@ -247,15 +251,20 @@ export function extendStudyAttemptBudget(ledger: StudyLedger, migratedAt: string
   }
   if (ledger.schemaVersion !== 1 || ledger.protocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH
     || ledger.attemptBudgetExtension || ledger.phase !== 'DEVELOPMENT' || ledger.freeze !== null
-    || ledger.attempts.length > 100 || !Number.isFinite(Date.parse(migratedAt))) {
+    || ledger.attempts.length > 100 || ledger.days.some(day => day.quality.status === 'PASS')
+    || !Number.isFinite(Date.parse(migratedAt))) {
     throw new Error('Study ledger is not the authorized 100-attempt predecessor');
   }
   assert100AttemptHistory(ledger);
+  ledger.days.forEach(validateDay);
   const next = structuredClone(ledger);
   next.protocolHash = STUDY_PROTOCOL_HASH;
   next.attemptBudgetExtension = {
     fromProtocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH, toProtocolHash: STUDY_PROTOCOL_HASH,
     fromLimit: 100, toLimit: 120, sourceLedgerHash: hashStudyValue(ledger), migratedAt,
+    qualityChange: { fromDailyTimerCoverage: .99,
+      toDailyTimerCoverage: studyProtocol.quality.minimumDailyTimerCoverage,
+      perInstrumentCoverage: studyProtocol.quality.minimumDailyPerInstrumentCoverage },
     oldAttemptCount: ledger.attempts.length,
     oldAttemptIdentityHash: hashStudyValue(ledger.attempts.map(attemptIdentity)),
     oldChunkCount: ledger.chunks.length, oldChunksHash: hashStudyValue(ledger.chunks),
@@ -382,6 +391,17 @@ export function acceptStudyChunk(ledger: StudyLedger, receipt: StudyChunkReceipt
   return next;
 }
 
+export function dailyQualityThresholds(protocolHash: string): { timer: number; perInstrument: number } {
+  if (protocolHash === STUDY_PROTOCOL_HASH) return {
+    timer: studyProtocol.quality.minimumDailyTimerCoverage,
+    perInstrument: studyProtocol.quality.minimumDailyPerInstrumentCoverage,
+  };
+  if (protocolHash === STUDY_100_ATTEMPT_PROTOCOL_HASH || protocolHash === STUDY_60_ATTEMPT_PROTOCOL_HASH) {
+    return { timer: .99, perInstrument: .8 };
+  }
+  throw new Error('Unknown daily study protocol');
+}
+
 function validateDay(receipt: StudyDayReceipt): void {
   if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash) || !receipt.dayId
     || !receipt.sessionDate.match(isoDate) || !hash.test(receipt.canonicalInputHash) || !hash.test(receipt.replayConfigHash)
@@ -402,7 +422,13 @@ function validateDay(receipt: StudyDayReceipt): void {
     || instruments.some(item => !Number.isFinite(item.usableShare) || item.usableShare < 0 || item.usableShare > 1)) {
     throw new Error('Daily study instrument quality is invalid');
   }
-  const passes = receipt.quality.recordedShare >= 0.99 && instruments.every(item => item.usableShare >= 0.8);
+  const thresholds = dailyQualityThresholds(receipt.protocolHash);
+  if (receipt.quality.thresholds && (receipt.quality.thresholds.timer !== thresholds.timer
+    || receipt.quality.thresholds.perInstrument !== thresholds.perInstrument)) {
+    throw new Error('Daily study quality thresholds contradict protocol');
+  }
+  const passes = receipt.quality.recordedShare >= thresholds.timer
+    && instruments.every(item => item.usableShare >= thresholds.perInstrument);
   if ((receipt.quality.status === 'PASS') !== passes) throw new Error('Daily study quality status contradicts thresholds');
 }
 function passedDates(ledger: StudyLedger, phase: 'DEVELOPMENT' | 'HOLDOUT'): string[] {
