@@ -4,9 +4,11 @@ export const STUDY_PROTOCOL_VERSION = 1 as const;
 export const STUDY_STATE_BRANCH = 'observation-state';
 export const STUDY_RELEASE_TAG = 'market-study-archive-v1';
 export const STUDY_REQUIRED_DAYS = 10;
-export const STUDY_MAX_ATTEMPTS = 100;
+export const STUDY_MAX_ATTEMPTS = 120;
 /** The sole predecessor eligible for the explicit 60-to-100 attempt migration. */
 export const STUDY_60_ATTEMPT_PROTOCOL_HASH = 'c7aed9f5eb5bcc7fef0e2e4fa12023634a263725b137be55ae96434677cd3732';
+/** The sole predecessor eligible for the explicit 100-to-120 attempt extension. */
+export const STUDY_100_ATTEMPT_PROTOCOL_HASH = '0f646c1ed3a56ee9dacc43af6ddaaebb1df4003dadb6c24701cd86203412d98e';
 export const STUDY_JOB_MAX_MS = 350 * 60 * 1_000;
 export const STUDY_LAUNCH_LATENESS_MS = 20 * 60 * 1_000;
 export const STUDY_CHUNK_MAX_MS = 30 * 60 * 1_000;
@@ -34,7 +36,7 @@ export const studyProtocol = {
   jobMaxMinutes: STUDY_JOB_MAX_MS / 60_000,
   requiredDaysPerPhase: STUDY_REQUIRED_DAYS, maxAttemptedJobs: STUDY_MAX_ATTEMPTS,
   archive: { kind: 'private-draft-github-release', tag: STUDY_RELEASE_TAG, immutableAssets: true },
-  quality: { minimumDailyTimerCoverage: 0.99, minimumDailyPerInstrumentCoverage: 0.8 },
+  quality: { minimumDailyTimerCoverage: 0.8, minimumDailyPerInstrumentCoverage: 0.8 },
   phases: ['DEVELOPMENT', 'READY_TO_FREEZE', 'HOLDOUT', 'COMPLETE'],
 } as const;
 

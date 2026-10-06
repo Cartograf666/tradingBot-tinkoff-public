@@ -6,9 +6,11 @@ import { defaultSimulationConfig, OrderBookSimulator, type SimulationResult } fr
 import { ObservedLiquidationTracker } from '../research/observed-liquidation.js';
 import { inspectReplayChunk, validateSessionChunks, consumeSessionChunks, SessionCoverage, type ReplayChunk } from '../research/session-replay.js';
 import type { ObservationManifest } from '../research/market-observation.js';
+import { studyProtocol } from '../research/study-protocol.js';
 
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const sourceFiles = ['src/report/replay-orderbook.ts', 'src/research/session-replay.ts',
+  'src/research/study-protocol.ts',
   'src/research/continuous-windows.ts', 'src/research/continuous-checkpoints.ts',
   'src/research/order-book-simulator.ts', 'src/research/market-observation.ts',
   'src/research/market-recording.ts', 'src/research/order-book-costs.ts',
@@ -71,7 +73,12 @@ async function replay(chunks: ReplayChunk[], output: string, options: SessionRep
     notes: ['Derived stream: original payloads preserved; global offsets start at the API session opening; every chunk boundary invalidates market state.'] };
   const scenarios = fixedReplayScenarios(), simulators = scenarios.map(s => new OrderBookSimulator(manifest, s.config));
   const riskTrackers = scenarios.map(s => new ObservedLiquidationTracker(s.config.initialCashRub));
-  const coverage = new SessionCoverage(manifest, start, end);
+  const coverage = scope === 'session'
+    ? new SessionCoverage(manifest, start, end, {
+      timer: studyProtocol.quality.minimumDailyTimerCoverage,
+      perInstrument: studyProtocol.quality.minimumDailyPerInstrumentCoverage,
+    })
+    : new SessionCoverage(manifest, start, end);
   const mappings = await consumeSessionChunks(ordered, manifest, start, event => {
     coverage.consume(event);
     simulators.forEach((simulator, index) => {

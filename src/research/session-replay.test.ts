@@ -126,6 +126,33 @@ test('85 missing seconds reject their 30-minute window but can pass the unchange
   assert.equal(day.result().perInstrument[0]!.usableShare, .9915);
 });
 
+test('the new whole-session 80 percent gate keeps missing time while diagnostic coverage remains 99 percent', () => {
+  const durationMs = 100_000, m = manifest('day', durationMs);
+  m.intervals[0]!.end = iso(durationMs + 1_000);
+  const daily = new SessionCoverage(m, start, start + durationMs, { timer: .8, perInstrument: .8 });
+  const diagnostic = new SessionCoverage(m, start, start + durationMs);
+  let sequence = 0;
+  const push = (kind: RecordedEvent['kind'], at: number, payload: unknown = {}) => {
+    const event: RecordedEvent = { schemaVersion: 1, runId: 'day', sequence: ++sequence, connectionEpoch: 1,
+      receivedAt: iso(at), monotonicOffsetNs: String(at * 1_000_000), kind, payload };
+    daily.consume(event); diagnostic.consume(event);
+  };
+  push('connect_attempt', 15_000);
+  push('response', 15_001, statuses);
+  push('response', 15_002, acks);
+  for (let second = 15; second < 100; second += 1) {
+    const at = second * 1_000;
+    push('response', at + 100, book(at + 100));
+    push('tick', at + 500);
+  }
+  assert.equal(daily.result().recordedShare, .85);
+  assert.equal(daily.result().perInstrument[0]?.usableShare, .85);
+  assert.equal(daily.result().status, 'PASS');
+  assert.deepEqual(daily.result().thresholds, { timer: .8, perInstrument: .8 });
+  assert.equal(diagnostic.result().status, 'INSUFFICIENT_DATA');
+  assert.deepEqual(diagnostic.result().thresholds, { timer: .99, perInstrument: .8 });
+});
+
 test('late capture never moves the day-end entry cutoff forward', async t => {
   const root = setup(t);
   const a = await inspectReplayChunk(writeChunk(root, 'a', [...frames(9_000), ['response', 9_100, book(9_100)], ['response', 9_200, book(9_200)], ['stop', 9_500]]));

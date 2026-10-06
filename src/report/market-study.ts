@@ -23,12 +23,12 @@ import { discoverMarketPilot } from '../research/market-pilot-runner.js';
 import { nextMainSessionWindow } from '../research/observation-session.js';
 import { runSmokeWithRetries, SmokeQualityError, StudyStageError, type SmokeCheckEvent } from './smoke-retry.js';
 import {
-  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, planStudyRunnerHandoff, planStudyCampaignReadiness,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_RELEASE_TAG, STUDY_STATE_BRANCH, STUDY_TICKERS, STUDY_LAUNCH_LATENESS_MS, STUDY_CHUNK_END_MARGIN_MS, assertStudyPreparationReady, canonicalJson, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, planStudyRunnerHandoff, planStudyCampaignReadiness,
   type StudyBlock, type StudyBlockPlan, type StudyChunkPlan,
 } from '../research/study-protocol.js';
 import {
   acceptStudyChunk, acceptStudyDay, assertStudyLedgerProtocol, beginStudyAttempt, createStudyLedger, freezeStudy,
-  mergeStudyLedgers, migrateStudyAttemptBudget, planStudyRun, StaleStudyDayInputError,
+  mergeStudyLedgers, migrateStudyAttemptBudget, extendStudyAttemptBudget, planStudyRun, StaleStudyDayInputError,
   type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger,
 } from '../research/study-state.js';
 
@@ -143,7 +143,7 @@ export function ledgerReadme(ledger: StudyLedger, repository: string): string {
   }
   const rows = [...aggregates.values()].map(item => `| ${item.phase} | ${item.scenario} | ${item.days} | ${item.entries} | ${item.netKnown ? item.net.toFixed(2) : '—'} | ${item.fees.toFixed(2)} | ${item.unresolved} |`).join('\n');
   const table = rows ? `\n| Phase | Scenario | Days | Entries | Net PnL, RUB | Fees, RUB | Unresolved |\n| --- | --- | ---: | ---: | ---: | ---: | ---: |\n${rows}\n` : '';
-  return `# Market study state\n\n- Phase: **${ledger.phase}**\n- Protocol: \`${ledger.protocolHash}\`\n- Development days: ${progress.developmentDays}/${progress.requiredDaysPerPhase}\n- Holdout days: ${progress.holdoutDays}/${progress.requiredDaysPerPhase}\n- Rejected finalized days: ${rejected}\n- Attempts: ${progress.usedAttempts}/${progress.maximumAttempts}; remaining: ${progress.remainingAttempts}\n- Entirely new days remaining: ${progress.remainingDays}; blocks needed: ${progress.blocksForEntirelyNewDays}; attempt reserve: ${progress.reserveForEntirelyNewDays}\n- Confirmed immutable chunks: ${ledger.chunks.length}\n- Archive: [private draft release](https://github.com/${repository}/releases/tag/${STUDY_RELEASE_TAG})\n- Updated: ${ledger.updatedAt}\n${table}\nPending and partially recorded days are not credited in the new-day capacity estimate. It has no failure reserve and makes no profitability claim or budget authorization. Quality acceptance is independent of replay PnL. The table includes passing days only, is descriptive, and never selects a winner. Raw recordings are release assets, never Git blobs.\n`;
+  return `# Market study state\n\n- Phase: **${ledger.phase}**\n- Protocol: \`${ledger.protocolHash}\`\n- Development days: ${progress.developmentDays}/${progress.requiredDaysPerPhase}\n- Holdout days: ${progress.holdoutDays}/${progress.requiredDaysPerPhase}\n- Rejected finalized days: ${rejected}\n- Attempts: ${progress.usedAttempts}/${progress.maximumAttempts}; remaining: ${progress.remainingAttempts}\n- Entirely new days remaining: ${progress.remainingDays}; blocks needed: ${progress.blocksForEntirelyNewDays}; attempt reserve: ${progress.reserveForEntirelyNewDays}\n- Confirmed immutable chunks: ${ledger.chunks.length}\n- Archive: [private draft release](https://github.com/${repository}/releases/tag/${STUDY_RELEASE_TAG})\n- Updated: ${ledger.updatedAt}\n${table}\nPending and partially recorded days are not credited in the new-day capacity estimate. Minimum required blocks exclude failed attempts; a positive reserve is available capacity, not a guarantee of complete data. This report makes no profitability claim or budget authorization. Quality acceptance is independent of replay PnL. The table includes passing days only, is descriptive, and never selects a winner. Raw recordings are release assets, never Git blobs.\n`;
 }
 /** One compare-and-swap commit keeps the receipt and ledger transition indivisible. */
 export async function migrateRemoteStudyAttemptBudget(repository: string, signal?: AbortSignal): Promise<StudyLedger> {
@@ -152,7 +152,7 @@ export async function migrateRemoteStudyAttemptBudget(repository: string, signal
     signal?.throwIfAborted();
     const remote = await readRemoteFile<StudyLedger>(repository, STATE_PATH, signal);
     const next = migrateStudyAttemptBudget(remote.value, new Date().toISOString());
-    if (remote.value.protocolHash === STUDY_PROTOCOL_HASH) return next;
+    if (remote.value.protocolHash === STUDY_100_ATTEMPT_PROTOCOL_HASH) return next;
     try {
       await putRemoteFile(repository, STATE_PATH, `${JSON.stringify(next, null, 2)}\n`, remote.sha,
         'Migrate market study attempt budget from 60 to 100', signal);
@@ -167,6 +167,37 @@ export async function migrateRemoteStudyAttemptBudget(repository: string, signal
     }
   }
   throw new Error('Study migration failed');
+}
+/** A changed source after a CAS conflict needs a new, explicit readiness decision. */
+export async function extendRemoteStudyAttemptBudget(repository: string, options: {
+  signal?: AbortSignal; validateCurrent: (ledger: StudyLedger) => Promise<void>;
+}): Promise<StudyLedger> {
+  await ensureStateBranch(repository);
+  let sourceHash: string | null = null;
+  for (let retry = 0; retry < 5; retry += 1) {
+    options.signal?.throwIfAborted();
+    const remote = await readRemoteFile<StudyLedger>(repository, STATE_PATH, options.signal);
+    await options.validateCurrent(remote.value);
+    options.signal?.throwIfAborted();
+    const currentHash = hashStudyValue(remote.value);
+    if (sourceHash !== null && sourceHash !== currentHash) throw new Error('Study extension source changed during optimistic retry');
+    sourceHash = currentHash;
+    const next = extendStudyAttemptBudget(remote.value, new Date().toISOString());
+    if (remote.value.protocolHash === STUDY_PROTOCOL_HASH) return next;
+    try {
+      await putRemoteFile(repository, STATE_PATH, `${JSON.stringify(next, null, 2)}\n`, remote.sha,
+        'Extend market study budget 100 to 120 and daily coverage 99 to 80 percent', options.signal);
+      try {
+        const readme = await readRemoteText(repository, README_PATH, options.signal);
+        await putRemoteFile(repository, README_PATH, ledgerReadme(next, repository), readme.sha, 'Update market study status', options.signal);
+      } catch { /* The ledger and extension receipt are authoritative. */ }
+      return next;
+    } catch (error) {
+      if (![409, 422].includes(ghErrorStatus(error) ?? 0)) throw error;
+      if (retry === 4) throw new Error('Study extension optimistic update failed after retries');
+    }
+  }
+  throw new Error('Study extension failed');
 }
 export async function updateRemoteLedger(
   repository: string,
@@ -614,7 +645,8 @@ export async function reconcileReleaseAssets(repository: string): Promise<StudyL
       const raw = JSON.parse(receiptBytes.stdout.toString('utf8'));
       const receipt = kind === 'chunk' ? recoveredChunkReceipt(raw, asset, archiveHash)
         : recoveredDayReceipt(raw, asset, archiveHash);
-      if (receipt.protocolHash === STUDY_60_ATTEMPT_PROTOCOL_HASH && ledger.attemptBudgetMigration) {
+      if ((receipt.protocolHash === STUDY_60_ATTEMPT_PROTOCOL_HASH && ledger.attemptBudgetMigration)
+        || (receipt.protocolHash === STUDY_100_ATTEMPT_PROTOCOL_HASH && ledger.attemptBudgetExtension)) {
         retiredProtocolAssets++;
         continue; // A pre-migration upload is archived evidence, never a new ledger input.
       }
@@ -1228,7 +1260,7 @@ export const CONTINUOUS_CAPTURE_POLICY_V2_HASH = hashStudyValue({
 // Two Sep 22 blocks reached 1 GiB; the faster one did so after about 4.40 hours. 1.5 GiB
 // covers five hours at that observed rate with more than 25% headroom and retains a hard cap.
 export const CONTINUOUS_CAPTURE_MAX_BYTES = 1536 * 1024 * 1024;
-// The scientific ledger and its frozen 99%/80% criteria remain compatible and immutable.
+// Capture provenance stays immutable; the daily quality contract changes only through an explicit ledger extension.
 export const continuousCapturePolicy = {
   version: 3, intervalMs: 300_000, maxPendingCheckpoints: 2, uploadDeadlineMs: 120_000,
   maxBytes: CONTINUOUS_CAPTURE_MAX_BYTES,
@@ -1343,6 +1375,14 @@ async function publishContinuousWindows(repository: string, directory: string, s
   }
   const assessments = await assessContinuousWindows(directory, plan.chunks);
   let ledger = (await readRemoteFile<StudyLedger>(repository, STATE_PATH)).value, saved = 0;
+  assertStudyLedgerProtocol(ledger);
+  const attemptIndex = ledger.attempts.findIndex(item => item.attemptId === draft.attemptId);
+  const attempt = ledger.attempts[attemptIndex];
+  if (!attempt || attempt.mode !== 'COUNTED' || attempt.sessionDate !== plan.sessionDate
+    || attempt.block !== plan.block || attempt.phase !== draft.phase
+    || (ledger.attemptBudgetExtension && attemptIndex < ledger.attemptBudgetExtension.oldAttemptCount)) {
+    throw new Error('Continuous draft belongs to an unknown or pre-extension attempt');
+  }
   for (const assessment of assessments) {
     const assetName = `study-${plan.sessionDate}-${plan.block}-${String(assessment.index).padStart(2, '0')}-${draft.attemptId.replace(':', '-')}.tar.gz`;
     if (ledger.chunks.some(item => item.assetName === assetName)) continue;
@@ -1688,7 +1728,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (command === 'migrate-attempt-budget') {
       const ledger = await migrateRemoteStudyAttemptBudget(repository, controller.signal);
       console.log(JSON.stringify({ action: 'ATTEMPT_BUDGET_MIGRATED', protocolHash: ledger.protocolHash,
-        attempts: ledger.attempts.length, limit: STUDY_MAX_ATTEMPTS,
+        attempts: ledger.attempts.length, limit: 100,
         sourceLedgerHash: ledger.attemptBudgetMigration?.sourceLedgerHash })); return;
     }
     if (command === 'freeze') {

@@ -6,8 +6,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CONTINUOUS_CAPTURE_POLICY_HASH, CONTINUOUS_CAPTURE_POLICY_V2_HASH, materializeStudyInputs, reconcileContinuousBlocks } from './market-study.js';
-import { STUDY_RELEASE_TAG } from '../research/study-protocol.js';
-import { beginStudyAttempt, createStudyLedger, type StudyChunkReceipt } from '../research/study-state.js';
+import { STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_RELEASE_TAG } from '../research/study-protocol.js';
+import { beginStudyAttempt, createStudyLedger, migrateStudyAttemptBudget, extendStudyAttemptBudget, type StudyChunkReceipt } from '../research/study-state.js';
 import { replayConfigHash, replaySourceHashes } from './replay-orderbook.js';
 import type { ObservationInstrument, ObservationManifest } from '../research/market-observation.js';
 import type { RecordedEvent, RecordedEventKind } from '../research/market-recording.js';
@@ -138,6 +138,27 @@ if(/\\/git\\/ref\\/heads\\/(observation-state|main)$/.test(endpoint)){process.st
 const m=/\\/contents\\/(.+?)(?:\\?ref=.*)?$/.exec(endpoint);if(m){const key=m[1];if(a.includes('PUT')){const input=a[a.indexOf('--input')+1],p=JSON.parse(fs.readFileSync(input));const old=f.files[key];if((old&&p.sha!==old.sha)||(!old&&p.sha))fail(409);const sha='sha-'+(++f.nextId);f.files[key]={content:p.content,sha};fs.appendFileSync(f.log,'PUT '+key+'\\n');save();process.stdout.write('{}');process.exit(0)}const v=f.files[key];if(!v)fail(404);process.stdout.write(JSON.stringify(v));process.exit(0)}
 fail(404);\n`);
   chmodSync(shim, 0o755); process.env.PATH = `${bin}${path.delimiter}${originalPath}`; process.env.CONTINUOUS_TEST_FIXTURE = fixture;
+  const originalFixtureState = readFileSync(fixture, 'utf8');
+  let sixty = createStudyLedger();
+  for (let index = 1; index <= 60; index += 1) sixty = beginStudyAttempt(sixty, {
+    runId: String(index), runAttempt: 1, sessionDate: date, block: 'early', mode: 'COUNTED', startedAt: iso(0),
+  });
+  sixty.protocolHash = STUDY_60_ATTEMPT_PROTOCOL_HASH;
+  const hundred = migrateStudyAttemptBudget(sixty, iso(0));
+  hundred.attempts.push(ledger.attempts[0]!);
+  const extended = extendStudyAttemptBudget(hundred, iso(20_000));
+  const oldRawFixture = JSON.parse(originalFixtureState);
+  oldRawFixture.files['study-ledger.json'].content = encode(extended);
+  writeFileSync(fixture, JSON.stringify(oldRawFixture));
+  const deniedWorkspace = path.join(root, 'restore-old-raw'); mkdirSync(deniedWorkspace);
+  assert.equal(await reconcileContinuousBlocks('owner/private', deniedWorkspace), 1,
+    'a raw block from before extension cannot create new scientific windows');
+  const denied = JSON.parse(readFileSync(fixture, 'utf8'));
+  assert.equal(denied.assets.some((asset: { name: string }) => asset.name.startsWith('study-')), false,
+    'the guard runs before any window archive upload');
+  assert.equal(denied.files['continuous-completed/100.json'], undefined);
+  assert.equal(JSON.parse(Buffer.from(denied.files['study-ledger.json'].content, 'base64').toString()).chunks.length, 0);
+  writeFileSync(fixture, originalFixtureState);
   const workspace1 = path.join(root, 'restore-1'); mkdirSync(workspace1);
   const firstResult = await reconcileContinuousBlocks('owner/private', workspace1);
   let state = JSON.parse(readFileSync(fixture, 'utf8'));

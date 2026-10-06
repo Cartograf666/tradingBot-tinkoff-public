@@ -32,7 +32,8 @@ const input = { replayConfigHash: hex('e'), simulatorHashes: { source: hex('f') 
 function replay(): ReplayReport {
   return { schemaVersion: 1, configHash: input.replayConfigHash, simulatorHashes: input.simulatorHashes, runtimeHashes: {},
     dataset: { scope: 'session', sessionDate: day, mainStart: plan.mainStart, mainEnd: plan.mainEnd, datasetHash: hex('1'), inputs: [], mappings: [] },
-    quality: { status: 'INSUFFICIENT_DATA', recordedShare: .5, expectedTicks: 2, observedTicks: 1, perInstrument: [] },
+    quality: { status: 'INSUFFICIENT_DATA', recordedShare: .5, expectedTicks: 2, observedTicks: 1, perInstrument: [],
+      thresholds: { timer: .8, perInstrument: .8 } },
     limitations: ['original limitation'], results: fixedReplayScenarios().map((scenario, index) => ({ name: scenario.name,
       strategy: index < 2 ? 'momentum' : 'exhaustion', scenario: index % 2 ? 'stress' : 'baseline', signals: index,
       entries: index + 1, closedTrades: index, netPnlRub: index === 0 ? null : index, realizedPnlRub: index,

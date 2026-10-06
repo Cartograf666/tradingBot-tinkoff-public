@@ -114,7 +114,11 @@ export class SessionCoverage {
   private readonly expected: string[];
   private connected = false;
   private epoch = 0;
-  constructor(private readonly manifest: ObservationManifest, private readonly start: number, private readonly end: number) {
+  constructor(private readonly manifest: ObservationManifest, private readonly start: number, private readonly end: number,
+    private readonly thresholds: Readonly<{ timer: number; perInstrument: number }> = { timer: .99, perInstrument: .8 }) {
+    if (![thresholds.timer, thresholds.perInstrument].every(value => Number.isFinite(value) && value >= 0 && value <= 1)) {
+      throw new Error('Invalid session coverage thresholds');
+    }
     this.expected = observationSubscriptions(manifest.instruments);
     for (const i of manifest.instruments) this.usable.set(i.uid, new Set());
   }
@@ -167,7 +171,9 @@ export class SessionCoverage {
     const recordedShare = this.recorded.size / expectedTicks;
     const perInstrument = this.manifest.instruments.map(i => ({ ticker: i.ticker,
       usableTicks: this.usable.get(i.uid)!.size, usableShare: this.usable.get(i.uid)!.size / expectedTicks }));
-    return { status: recordedShare >= .99 && perInstrument.every(i => i.usableShare >= .8) ? 'PASS' as const : 'INSUFFICIENT_DATA' as const,
-      recordedShare, perInstrument, expectedTicks, observedTicks: this.recorded.size };
+    return { status: recordedShare >= this.thresholds.timer && perInstrument.every(i => i.usableShare >= this.thresholds.perInstrument)
+      ? 'PASS' as const : 'INSUFFICIENT_DATA' as const,
+      recordedShare, perInstrument, expectedTicks, observedTicks: this.recorded.size,
+      thresholds: { ...this.thresholds } };
   }
 }

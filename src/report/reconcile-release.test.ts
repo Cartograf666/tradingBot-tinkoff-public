@@ -5,10 +5,10 @@ import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { migrateRemoteStudyAttemptBudget, reconcileReleaseAssets } from './market-study.js';
-import { acceptStudyChunk, acceptStudyDay, beginStudyAttempt, createStudyLedger, migrateStudyAttemptBudget,
+import { migrateRemoteStudyAttemptBudget, extendRemoteStudyAttemptBudget, reconcileReleaseAssets } from './market-study.js';
+import { acceptStudyChunk, acceptStudyDay, beginStudyAttempt, createStudyLedger, migrateStudyAttemptBudget, extendStudyAttemptBudget,
   type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger } from '../research/study-state.js';
-import { hashStudyValue, planStudyBlock, STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH } from '../research/study-protocol.js';
+import { hashStudyValue, planStudyBlock, STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH } from '../research/study-protocol.js';
 import { selectStudyDayInputs, studyDayInputHash } from '../research/study-day-inputs.js';
 
 const date = '2026-09-14', hex = (digit: string) => digit.repeat(64);
@@ -61,7 +61,7 @@ function archive(root: string, id: number, name: string, receiptName: string, dr
 }
 
 function fixture(t: TestContext, ledger: StudyLedger, options: {
-  day: boolean; retry: boolean; retiredRetry?: boolean; duplicateDay?: boolean; reportSource?: StudyLedger;
+  day: boolean; retry: boolean; retiredRetry?: boolean; retiredRetryProtocol?: string; duplicateDay?: boolean; reportSource?: StudyLedger;
   starterDay?: boolean; raceLedger?: StudyLedger; publicRepository?: boolean }) {
   const root = mkdtempSync(path.join(tmpdir(), 'study-release-recovery-'));
   const oldPath = process.env.PATH, oldFixture = process.env.RECOVERY_TEST_FIXTURE;
@@ -78,7 +78,8 @@ function fixture(t: TestContext, ledger: StudyLedger, options: {
   if (options.retiredRetry) {
     const { assetId: _id, assetDigest: _digest, assetBytes: _size, archiveSha256: _hash, ...draft } = retry(ledger);
     assets.push(archive(root, 29, `study-${date}-late-01-old-retry.tar.gz`, 'study-chunk-receipt.json',
-      { ...draft, protocolHash: STUDY_60_ATTEMPT_PROTOCOL_HASH, assetName: `study-${date}-late-01-old-retry.tar.gz` }));
+      { ...draft, protocolHash: options.retiredRetryProtocol ?? STUDY_60_ATTEMPT_PROTOCOL_HASH,
+        assetName: `study-${date}-late-01-old-retry.tar.gz` }));
   }
   if (options.day) assets.push(archive(root, 50, `study-day-${date}-first.tar.gz`, 'study-day-receipt.json', reportDraft(options.reportSource ?? ledger)));
   if (options.starterDay) assets.find(asset => asset.id === 50)!.state = 'starter';
@@ -134,6 +135,44 @@ test('migration refuses a public repository before writing state', async t => {
   assert.equal(state.serial, 0);
 });
 
+test('remote extension requires an awaited safety check before its single ledger commit', async t => {
+  const old = migrateStudyAttemptBudget(exhaustedPredecessor(), '2026-10-05T10:00:00.000Z');
+  fixture(t, old, { day: false, retry: false });
+  let checked = 0;
+  const validateCurrent = async (ledger: StudyLedger) => {
+    assert.equal(ledger.protocolHash, old.protocolHash);
+    await Promise.resolve();
+    checked += 1;
+  };
+  const extended = await extendRemoteStudyAttemptBudget('owner/private', { validateCurrent });
+  assert.equal(checked, 1);
+  assert.equal(extended.attemptBudgetExtension?.sourceLedgerHash, hashStudyValue(old));
+  assert.deepEqual(extended.attemptBudgetMigration, old.attemptBudgetMigration);
+  assert.deepEqual(extended.attempts, old.attempts);
+  assert.deepEqual(extended.chunks, old.chunks);
+  const state = JSON.parse(readFileSync(process.env.RECOVERY_TEST_FIXTURE!, 'utf8'));
+  assert.equal(state.serial, 2, 'one ledger commit plus derived README');
+  await assert.rejects(extendRemoteStudyAttemptBudget('owner/private', {
+    validateCurrent: async () => { throw new Error('cutover no longer safe'); },
+  }), /cutover no longer safe/);
+  assert.equal(JSON.parse(readFileSync(process.env.RECOVERY_TEST_FIXTURE!, 'utf8')).serial, 2);
+});
+
+test('remote extension retries the safety check and rejects a changed CAS source', async t => {
+  const old = migrateStudyAttemptBudget(exhaustedPredecessor(), '2026-10-05T10:00:00.000Z');
+  const raced = structuredClone(old);
+  raced.attempts[0]!.status = 'FAILED';
+  fixture(t, old, { day: false, retry: false, raceLedger: raced });
+  let checked = 0;
+  await assert.rejects(extendRemoteStudyAttemptBudget('owner/private', {
+    validateCurrent: async () => { checked += 1; },
+  }), /source changed during optimistic retry/);
+  assert.equal(checked, 2);
+  const state = JSON.parse(readFileSync(process.env.RECOVERY_TEST_FIXTURE!, 'utf8'));
+  assert.equal(state.serial, 0);
+  assert.equal(state.files['study-ledger.json'].sha, 'raced');
+});
+
 test('recovery processes a confirmed PASS retry before an obsolete uploaded day report', async t => {
   fixture(t, ledgerWithFullDay(), { day: true, retry: true });
   const recovered = await reconcileReleaseAssets('owner/private');
@@ -159,7 +198,7 @@ test('starter receipt is skipped, never accepted, and does not block other uploa
   assert.equal(recovered.days.length, 0);
 });
 
-test('retired uploaded receipt is deferred while a new-protocol receipt recovers', async t => {
+test('retired uploaded receipt is deferred after the second migration', async t => {
   let old = ledgerWithFullDay();
   for (let index = 4; index <= 60; index += 1) old = beginStudyAttempt(old, {
     runId: String(index), runAttempt: 1, sessionDate: date, block: 'late',
@@ -167,13 +206,31 @@ test('retired uploaded receipt is deferred while a new-protocol receipt recovers
   });
   old.protocolHash = STUDY_60_ATTEMPT_PROTOCOL_HASH;
   for (const receipt of old.chunks) receipt.protocolHash = STUDY_60_ATTEMPT_PROTOCOL_HASH;
-  const migrated = migrateStudyAttemptBudget(old, '2026-10-05T10:00:00.000Z');
-  fixture(t, migrated, { day: false, retry: true, retiredRetry: true });
+  const migrated = extendStudyAttemptBudget(migrateStudyAttemptBudget(old, '2026-10-05T10:00:00.000Z'), '2026-10-06T10:00:00.000Z');
+  fixture(t, migrated, { day: false, retry: false, retiredRetry: true });
   const recovered = await reconcileReleaseAssets('owner/private');
-  assert.equal(recovered.chunks.length, 21);
-  assert.equal(recovered.chunks.at(-1)?.protocolHash, STUDY_PROTOCOL_HASH);
+  assert.equal(recovered.chunks.length, 20);
+  assert.equal(recovered.chunks.at(-1)?.protocolHash, STUDY_60_ATTEMPT_PROTOCOL_HASH);
   assert.equal(recovered.chunks.some(receipt => receipt.assetId === 29), false);
-  assert.equal(recovered.canonicalChunks[`${date}:late:1`], 30);
+  assert.equal(recovered.canonicalChunks[`${date}:late:1`], undefined);
+});
+
+test('an uncommitted 100-era retry remains archived after extension', async t => {
+  let old = ledgerWithFullDay();
+  for (let index = 4; index <= 60; index += 1) old = beginStudyAttempt(old, {
+    runId: String(index), runAttempt: 1, sessionDate: date, block: 'late',
+    mode: 'COUNTED', startedAt: `${date}T11:05:00.000Z`,
+  });
+  old.protocolHash = STUDY_60_ATTEMPT_PROTOCOL_HASH;
+  for (const receipt of old.chunks) receipt.protocolHash = STUDY_60_ATTEMPT_PROTOCOL_HASH;
+  const hundred = migrateStudyAttemptBudget(old, '2026-10-05T10:00:00.000Z');
+  const extended = extendStudyAttemptBudget(hundred, '2026-10-06T10:00:00.000Z');
+  fixture(t, extended, { day: false, retry: false, retiredRetry: true,
+    retiredRetryProtocol: STUDY_100_ATTEMPT_PROTOCOL_HASH });
+  const recovered = await reconcileReleaseAssets('owner/private');
+  assert.equal(recovered.chunks.length, 20);
+  assert.equal(recovered.chunks.some(receipt => receipt.assetId === 29), false);
+  assert.deepEqual(recovered.attemptBudgetExtension, extended.attemptBudgetExtension);
 });
 
 test('a starter-only day report stays absent from the full-day denominator', async t => {

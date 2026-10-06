@@ -1,6 +1,6 @@
 import {
-  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_REQUIRED_DAYS,
-  STUDY_TICKERS, hashStudyValue, type StudyBlock,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH, STUDY_REQUIRED_DAYS,
+  STUDY_TICKERS, studyProtocol, hashStudyValue, type StudyBlock,
 } from './study-protocol.js';
 import { expectedStudyDayChunks, selectStudyDayInputs, studyDayInputHash } from './study-day-inputs.js';
 
@@ -48,6 +48,7 @@ export interface DailyStudyQuality {
   expectedTicks: number;
   observedTicks: number;
   perInstrument: Array<{ ticker: string; usableShare: number }>;
+  thresholds?: { timer: number; perInstrument: number };
 }
 export interface StudyDayReceipt {
   schemaVersion: 1;
@@ -89,12 +90,13 @@ export interface StudyLedger {
   freeze: StudyFreeze | null;
   updatedAt: string;
   attemptBudgetMigration?: StudyAttemptBudgetMigration;
+  attemptBudgetExtension?: StudyAttemptBudgetExtension;
 }
 
 /** Durable proof of the one supported predecessor. Historical receipts keep their original hashes. */
 export interface StudyAttemptBudgetMigration {
   fromProtocolHash: typeof STUDY_60_ATTEMPT_PROTOCOL_HASH;
-  toProtocolHash: typeof STUDY_PROTOCOL_HASH;
+  toProtocolHash: typeof STUDY_100_ATTEMPT_PROTOCOL_HASH;
   sourceLedgerHash: string;
   migratedAt: string;
   legacyAttemptCount: 60;
@@ -103,6 +105,26 @@ export interface StudyAttemptBudgetMigration {
   legacyChunksHash: string;
   legacyCanonicalKeys: string[];
   legacyCanonicalsHash: string;
+}
+
+/** Pins every identity present when the 100-attempt ledger is explicitly extended. */
+export interface StudyAttemptBudgetExtension {
+  fromProtocolHash: typeof STUDY_100_ATTEMPT_PROTOCOL_HASH;
+  toProtocolHash: typeof STUDY_PROTOCOL_HASH;
+  fromLimit: 100;
+  toLimit: 120;
+  qualityChange: { fromDailyTimerCoverage: 0.99; toDailyTimerCoverage: 0.8; perInstrumentCoverage: 0.8 };
+  sourceLedgerHash: string;
+  migratedAt: string;
+  oldAttemptCount: number;
+  oldAttemptIdentityHash: string;
+  oldChunkCount: number;
+  oldChunksHash: string;
+  oldCanonicalKeys: string[];
+  oldCanonicalsHash: string;
+  oldDayCount: number;
+  oldDaysHash: string;
+  originalMigrationHash: string;
 }
 
 /** An immutable uploaded report can lose an optimistic race to a newer
@@ -125,13 +147,48 @@ function attemptIdentity(attempt: StudyAttempt): Omit<StudyAttempt, 'status'> {
 
 export function assertStudyLedgerProtocol(ledger: StudyLedger): void {
   if (ledger.schemaVersion !== 1 || ledger.protocolHash !== STUDY_PROTOCOL_HASH) throw new Error('Study ledger protocol mismatch');
-  const migration = ledger.attemptBudgetMigration;
-  if (!migration) {
+  const extension = ledger.attemptBudgetExtension;
+  if (!extension) {
+    if (ledger.attemptBudgetMigration) throw new Error('Study ledger has no attempt-budget extension receipt');
     if (ledger.chunks.some(chunk => chunk.protocolHash !== STUDY_PROTOCOL_HASH)
       || ledger.days.some(day => day.protocolHash !== STUDY_PROTOCOL_HASH)) throw new Error('Study ledger contains foreign receipts');
     return;
   }
-  if (migration.fromProtocolHash !== STUDY_60_ATTEMPT_PROTOCOL_HASH || migration.toProtocolHash !== STUDY_PROTOCOL_HASH
+  assert100AttemptHistory(ledger, extension);
+  if (extension.fromProtocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH || extension.toProtocolHash !== STUDY_PROTOCOL_HASH
+    || extension.fromLimit !== 100 || extension.toLimit !== 120
+    || !extension.qualityChange || hashStudyValue(extension.qualityChange) !== hashStudyValue({ fromDailyTimerCoverage: .99,
+      toDailyTimerCoverage: .8, perInstrumentCoverage: .8 })
+    || !hash.test(extension.sourceLedgerHash) || !Number.isFinite(Date.parse(extension.migratedAt))
+    || !Number.isSafeInteger(extension.oldAttemptCount) || extension.oldAttemptCount < 0 || extension.oldAttemptCount > 100
+    || !Number.isSafeInteger(extension.oldChunkCount) || extension.oldChunkCount < 0
+    || !Number.isSafeInteger(extension.oldDayCount) || extension.oldDayCount < 0
+    || !hash.test(extension.oldAttemptIdentityHash) || !hash.test(extension.oldChunksHash)
+    || !hash.test(extension.oldCanonicalsHash) || !hash.test(extension.oldDaysHash)
+    || !hash.test(extension.originalMigrationHash)
+    || !Array.isArray(extension.oldCanonicalKeys)
+    || new Set(extension.oldCanonicalKeys).size !== extension.oldCanonicalKeys.length
+    || extension.oldCanonicalKeys.some(key => typeof key !== 'string')
+    || ledger.attempts.length < extension.oldAttemptCount || ledger.chunks.length < extension.oldChunkCount
+    || ledger.days.length < extension.oldDayCount
+    || hashStudyValue(ledger.attempts.slice(0, extension.oldAttemptCount).map(attemptIdentity)) !== extension.oldAttemptIdentityHash
+    || hashStudyValue(ledger.chunks.slice(0, extension.oldChunkCount)) !== extension.oldChunksHash
+    || extension.oldCanonicalKeys.some(key => !Object.hasOwn(ledger.canonicalChunks, key))
+    || hashStudyValue(Object.fromEntries(extension.oldCanonicalKeys.map(key => [key, ledger.canonicalChunks[key]])))
+      !== extension.oldCanonicalsHash
+    || hashStudyValue(ledger.days.slice(0, extension.oldDayCount)) !== extension.oldDaysHash
+    || hashStudyValue(ledger.attemptBudgetMigration) !== extension.originalMigrationHash
+    || ledger.chunks.slice(extension.oldChunkCount).some(chunk => chunk.protocolHash !== STUDY_PROTOCOL_HASH)
+    || ledger.days.slice(extension.oldDayCount).some(day => day.protocolHash !== STUDY_PROTOCOL_HASH)
+    || ledger.attempts.length > STUDY_MAX_ATTEMPTS) {
+    throw new Error('Study attempt-budget extension receipt or historical data changed');
+  }
+}
+
+function assert100AttemptHistory(ledger: StudyLedger, extension?: StudyAttemptBudgetExtension): void {
+  const migration = ledger.attemptBudgetMigration;
+  if (!migration || migration.fromProtocolHash !== STUDY_60_ATTEMPT_PROTOCOL_HASH
+    || migration.toProtocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH
     || !hash.test(migration.sourceLedgerHash) || !Number.isFinite(Date.parse(migration.migratedAt))
     || migration.legacyAttemptCount !== 60 || !Number.isSafeInteger(migration.legacyChunkCount)
     || migration.legacyChunkCount < 0 || !hash.test(migration.legacyAttemptIdentityHash)
@@ -145,17 +202,16 @@ export function assertStudyLedgerProtocol(ledger: StudyLedger): void {
     || migration.legacyCanonicalKeys.some(key => !Object.hasOwn(ledger.canonicalChunks, key))
     || hashStudyValue(Object.fromEntries(migration.legacyCanonicalKeys.map(key => [key, ledger.canonicalChunks[key]])))
       !== migration.legacyCanonicalsHash
-    || ledger.chunks.slice(migration.legacyChunkCount).some(chunk => chunk.protocolHash !== STUDY_PROTOCOL_HASH)
-    || ledger.days.some(day => day.protocolHash !== STUDY_PROTOCOL_HASH)) {
+    || ledger.chunks.slice(migration.legacyChunkCount, extension?.oldChunkCount).some(chunk => chunk.protocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH)
+    || ledger.days.slice(0, extension?.oldDayCount).some(day => day.protocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH)) {
     throw new Error('Study attempt-budget migration receipt or historical data changed');
   }
 }
 
 /** Explicit, one-time transition; a normal writer must never upgrade a ledger on read. */
 export function migrateStudyAttemptBudget(ledger: StudyLedger, migratedAt: string): StudyLedger {
-  if (ledger.protocolHash === STUDY_PROTOCOL_HASH) {
-    assertStudyLedgerProtocol(ledger);
-    if (!ledger.attemptBudgetMigration) throw new Error('Study ledger has no attempt-budget migration receipt');
+  if (ledger.protocolHash === STUDY_100_ATTEMPT_PROTOCOL_HASH) {
+    assert100AttemptHistory(ledger);
     return structuredClone(ledger);
   }
   if (ledger.schemaVersion !== 1 || ledger.protocolHash !== STUDY_60_ATTEMPT_PROTOCOL_HASH
@@ -172,15 +228,50 @@ export function migrateStudyAttemptBudget(ledger: StudyLedger, migratedAt: strin
     throw new Error('Legacy study ledger has inconsistent attempt or canonical identity');
   }
   const next = structuredClone(ledger);
-  next.protocolHash = STUDY_PROTOCOL_HASH;
+  next.protocolHash = STUDY_100_ATTEMPT_PROTOCOL_HASH;
   next.attemptBudgetMigration = {
-    fromProtocolHash: STUDY_60_ATTEMPT_PROTOCOL_HASH, toProtocolHash: STUDY_PROTOCOL_HASH,
+    fromProtocolHash: STUDY_60_ATTEMPT_PROTOCOL_HASH, toProtocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH,
     sourceLedgerHash: hashStudyValue(ledger), migratedAt, legacyAttemptCount: 60,
     legacyChunkCount: ledger.chunks.length,
     legacyAttemptIdentityHash: hashStudyValue(ledger.attempts.map(attemptIdentity)),
     legacyChunksHash: hashStudyValue(ledger.chunks),
     legacyCanonicalKeys: Object.keys(ledger.canonicalChunks).sort(),
     legacyCanonicalsHash: hashStudyValue(ledger.canonicalChunks),
+  };
+  assert100AttemptHistory(next);
+  return next;
+}
+
+/** Explicit joint 100/99-to-120/80 transition; historical receipts and migration stay unchanged. */
+export function extendStudyAttemptBudget(ledger: StudyLedger, migratedAt: string): StudyLedger {
+  if (ledger.protocolHash === STUDY_PROTOCOL_HASH) {
+    assertStudyLedgerProtocol(ledger);
+    if (!ledger.attemptBudgetExtension) throw new Error('Study ledger has no attempt-budget extension receipt');
+    return structuredClone(ledger);
+  }
+  if (ledger.schemaVersion !== 1 || ledger.protocolHash !== STUDY_100_ATTEMPT_PROTOCOL_HASH
+    || ledger.attemptBudgetExtension || ledger.phase !== 'DEVELOPMENT' || ledger.freeze !== null
+    || ledger.attempts.length > 100 || ledger.days.some(day => day.quality.status === 'PASS')
+    || !Number.isFinite(Date.parse(migratedAt))) {
+    throw new Error('Study ledger is not the authorized 100-attempt predecessor');
+  }
+  assert100AttemptHistory(ledger);
+  ledger.days.forEach(validateDay);
+  const next = structuredClone(ledger);
+  next.protocolHash = STUDY_PROTOCOL_HASH;
+  next.attemptBudgetExtension = {
+    fromProtocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH, toProtocolHash: STUDY_PROTOCOL_HASH,
+    fromLimit: 100, toLimit: 120, sourceLedgerHash: hashStudyValue(ledger), migratedAt,
+    qualityChange: { fromDailyTimerCoverage: .99,
+      toDailyTimerCoverage: studyProtocol.quality.minimumDailyTimerCoverage,
+      perInstrumentCoverage: studyProtocol.quality.minimumDailyPerInstrumentCoverage },
+    oldAttemptCount: ledger.attempts.length,
+    oldAttemptIdentityHash: hashStudyValue(ledger.attempts.map(attemptIdentity)),
+    oldChunkCount: ledger.chunks.length, oldChunksHash: hashStudyValue(ledger.chunks),
+    oldCanonicalKeys: Object.keys(ledger.canonicalChunks).sort(),
+    oldCanonicalsHash: hashStudyValue(ledger.canonicalChunks),
+    oldDayCount: ledger.days.length, oldDaysHash: hashStudyValue(ledger.days),
+    originalMigrationHash: hashStudyValue(ledger.attemptBudgetMigration),
   };
   assertStudyLedgerProtocol(next);
   return next;
@@ -256,7 +347,7 @@ export function beginStudyAttempt(
 }
 
 function validateChunk(receipt: StudyChunkReceipt): void {
-  if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash)
+  if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash)
     || !Number.isSafeInteger(receipt.assetId)
     || receipt.assetId <= 0 || !receipt.assetName || !digest.test(receipt.assetDigest) || !hash.test(receipt.archiveSha256)
     || !Number.isSafeInteger(receipt.assetBytes) || receipt.assetBytes <= 0 || !receipt.chunkId || !receipt.attemptId
@@ -287,6 +378,8 @@ export function acceptStudyChunk(ledger: StudyLedger, receipt: StudyChunkReceipt
   const attempt = next.attempts.find((item) => item.attemptId === receipt.attemptId);
   if (!attempt || attempt.mode !== 'COUNTED' || attempt.phase !== receipt.phase
     || attempt.sessionDate !== receipt.sessionDate || attempt.block !== receipt.block) throw new Error('Chunk does not match its persisted attempt');
+  if (next.attemptBudgetExtension && next.attempts.slice(0, next.attemptBudgetExtension.oldAttemptCount)
+    .some(item => item.attemptId === receipt.attemptId)) throw new Error('Pre-extension attempt cannot create a new scientific receipt');
   if (receipt.phase === 'HOLDOUT' && (!next.freeze || receipt.replayConfigHash !== next.freeze.replayConfigHash
     || !sameHashes(receipt.simulatorHashes, next.freeze.simulatorHashes))) throw new Error('Holdout capture differs from the frozen implementation');
   next.chunks.push(structuredClone(receipt));
@@ -298,8 +391,19 @@ export function acceptStudyChunk(ledger: StudyLedger, receipt: StudyChunkReceipt
   return next;
 }
 
+export function dailyQualityThresholds(protocolHash: string): { timer: number; perInstrument: number } {
+  if (protocolHash === STUDY_PROTOCOL_HASH) return {
+    timer: studyProtocol.quality.minimumDailyTimerCoverage,
+    perInstrument: studyProtocol.quality.minimumDailyPerInstrumentCoverage,
+  };
+  if (protocolHash === STUDY_100_ATTEMPT_PROTOCOL_HASH || protocolHash === STUDY_60_ATTEMPT_PROTOCOL_HASH) {
+    return { timer: .99, perInstrument: .8 };
+  }
+  throw new Error('Unknown daily study protocol');
+}
+
 function validateDay(receipt: StudyDayReceipt): void {
-  if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash) || !receipt.dayId
+  if (receipt.schemaVersion !== 1 || ![STUDY_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_60_ATTEMPT_PROTOCOL_HASH].includes(receipt.protocolHash) || !receipt.dayId
     || !receipt.sessionDate.match(isoDate) || !hash.test(receipt.canonicalInputHash) || !hash.test(receipt.replayConfigHash)
     || !receipt.chunkAssetIds.length || new Set(receipt.chunkAssetIds).size !== receipt.chunkAssetIds.length
     || !Number.isFinite(receipt.quality.recordedShare) || receipt.quality.recordedShare < 0 || receipt.quality.recordedShare > 1
@@ -318,7 +422,13 @@ function validateDay(receipt: StudyDayReceipt): void {
     || instruments.some(item => !Number.isFinite(item.usableShare) || item.usableShare < 0 || item.usableShare > 1)) {
     throw new Error('Daily study instrument quality is invalid');
   }
-  const passes = receipt.quality.recordedShare >= 0.99 && instruments.every(item => item.usableShare >= 0.8);
+  const thresholds = dailyQualityThresholds(receipt.protocolHash);
+  if (receipt.quality.thresholds && (receipt.quality.thresholds.timer !== thresholds.timer
+    || receipt.quality.thresholds.perInstrument !== thresholds.perInstrument)) {
+    throw new Error('Daily study quality thresholds contradict protocol');
+  }
+  const passes = receipt.quality.recordedShare >= thresholds.timer
+    && instruments.every(item => item.usableShare >= thresholds.perInstrument);
   if ((receipt.quality.status === 'PASS') !== passes) throw new Error('Daily study quality status contradicts thresholds');
 }
 function passedDates(ledger: StudyLedger, phase: 'DEVELOPMENT' | 'HOLDOUT'): string[] {
@@ -380,6 +490,10 @@ export function acceptStudyDay(ledger: StudyLedger, receipt: StudyDayReceipt): S
     return next;
   }
   if (receipt.protocolHash !== STUDY_PROTOCOL_HASH) throw new Error('New day report uses a retired study protocol');
+  if (next.attemptBudgetExtension && next.attempts.slice(0, next.attemptBudgetExtension.oldAttemptCount)
+    .some(attempt => attempt.sessionDate === receipt.sessionDate)) {
+    throw new Error('Pre-extension study date cannot create a new scientific day');
+  }
   if (receipt.phase !== phaseForCapture(next.phase)) throw new Error('Day phase does not match ledger phase');
   if (receipt.phase === 'HOLDOUT' && next.freeze?.developmentDates.includes(receipt.sessionDate)) throw new Error('Development day leaked into holdout');
   assertDayInputs(next, receipt);
@@ -438,6 +552,9 @@ export function mergeStudyLedgers(left: StudyLedger, right: StudyLedger): StudyL
   const merged = clone(left), incoming = clone(right);
   if (JSON.stringify(merged.attemptBudgetMigration ?? null) !== JSON.stringify(incoming.attemptBudgetMigration ?? null)) {
     throw new Error('Conflicting study attempt-budget migrations');
+  }
+  if (JSON.stringify(merged.attemptBudgetExtension ?? null) !== JSON.stringify(incoming.attemptBudgetExtension ?? null)) {
+    throw new Error('Conflicting study attempt-budget extensions');
   }
   const leftCanonicals = { ...merged.canonicalChunks };
   if (merged.freeze && incoming.freeze && JSON.stringify(merged.freeze) !== JSON.stringify(incoming.freeze)) throw new Error('Conflicting study freezes');
