@@ -272,8 +272,8 @@ test('README performance aggregate excludes finalized days that failed the quali
   const markdown = ledgerReadme(ledger, 'owner/private');
   assert.match(markdown, /\| DEVELOPMENT \| baseline \| 1 \| 2 \| 4\.00 \| 3\.00 \| 0 \|/);
   assert.match(markdown, /Rejected finalized days: 1/);
-  assert.match(markdown, /Attempts: 0\/100; remaining: 100/);
-  assert.match(markdown, /Entirely new days remaining: 19; blocks needed: 38; attempt reserve: 62/);
+  assert.match(markdown, /Attempts: 0\/120; remaining: 120/);
+  assert.match(markdown, /Entirely new days remaining: 19; blocks needed: 38; attempt reserve: 82/);
   assert.match(markdown, /Pending and partially recorded days are not credited/);
   assert.doesNotMatch(markdown, /1000\.00/);
 });

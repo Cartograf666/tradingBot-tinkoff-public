@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, planStudyRunnerHandoff, planStudyCampaignReadiness, studyProtocol,
+  STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH, assertStudyPreparationReady, chunkDurationSeconds, hashStudyValue, planRecoverableStudyBlock, planStudyBlock, planStudyPreparation, planStudyRunnerHandoff, planStudyCampaignReadiness, studyProtocol,
 } from './study-protocol.js';
 
 test('protocol hash covers the paused full-session collection contract', () => {
   assert.equal(STUDY_PROTOCOL_HASH, hashStudyValue(studyProtocol));
-  assert.equal(STUDY_PROTOCOL_HASH, '0f646c1ed3a56ee9dacc43af6ddaaebb1df4003dadb6c24701cd86203412d98e');
-  assert.equal(studyProtocol.maxAttemptedJobs, 100);
+  assert.equal(STUDY_PROTOCOL_HASH, '6cd4975346001250f72074025018a31328347c41e03061e1cf3d656a73524bbd');
+  assert.equal(studyProtocol.maxAttemptedJobs, 120);
+  assert.equal(STUDY_100_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 100 }));
   assert.equal(STUDY_60_ATTEMPT_PROTOCOL_HASH, hashStudyValue({ ...studyProtocol, maxAttemptedJobs: 60 }));
   assert.equal(studyProtocol.campaignEnabledByDefault, false);
   assert.deepEqual(studyProtocol.automaticBlockCheck,

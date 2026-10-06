@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acceptStudyChunk, acceptStudyDay, beginStudyAttempt, createStudyLedger, freezeStudy,
-  mergeStudyLedgers, migrateStudyAttemptBudget, planStudyRun, type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger,
+  mergeStudyLedgers, migrateStudyAttemptBudget, extendStudyAttemptBudget, planStudyRun, type StudyChunkReceipt, type StudyDayReceipt, type StudyLedger,
 } from './study-state.js';
-import { hashStudyValue, planStudyBlock, STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_PROTOCOL_HASH } from './study-protocol.js';
+import { hashStudyValue, planStudyBlock, STUDY_60_ATTEMPT_PROTOCOL_HASH, STUDY_100_ATTEMPT_PROTOCOL_HASH, STUDY_MAX_ATTEMPTS, STUDY_PROTOCOL_HASH } from './study-protocol.js';
 import { selectStudyDayInputs, studyDayInputHash } from './study-day-inputs.js';
 
 const hex = (digit: string) => digit.repeat(64);
@@ -112,9 +112,9 @@ test('all counted development days use one replay implementation identity', () =
 
 test('optimistic merge cannot exceed the hard attempted-job ceiling', () => {
   let base = createStudyLedger();
-  for (let index = 1; index <= 99; index += 1) base = begin(base, '2026-09-14', index % 2 ? 'early' : 'late', index);
-  const left = begin(base, '2026-09-14', 'early', 100);
-  const right = begin(base, '2026-09-14', 'late', 101);
+  for (let index = 1; index < STUDY_MAX_ATTEMPTS; index += 1) base = begin(base, '2026-09-14', index % 2 ? 'early' : 'late', index);
+  const left = begin(base, '2026-09-14', 'early', STUDY_MAX_ATTEMPTS);
+  const right = begin(base, '2026-09-14', 'late', STUDY_MAX_ATTEMPTS + 1);
   assert.throws(() => mergeStudyLedgers(left, right), /exceed the campaign limit/);
 });
 
@@ -133,16 +133,18 @@ test('explicit 60-to-100 migration preserves immutable history and admits attemp
   const next = migrateStudyAttemptBudget(old, '2026-10-05T10:00:00.000Z');
   assert.deepEqual(old, original);
   assert.equal(next.attemptBudgetMigration?.sourceLedgerHash, oldHash);
-  assert.equal(next.protocolHash, STUDY_PROTOCOL_HASH);
+  assert.equal(next.protocolHash, STUDY_100_ATTEMPT_PROTOCOL_HASH);
   assert.deepEqual(next.attempts, old.attempts);
   assert.deepEqual(next.chunks, old.chunks);
   assert.deepEqual(next.canonicalChunks, old.canonicalChunks);
   assert.deepEqual(next.days, old.days);
   assert.equal(next.freeze, old.freeze);
-  assert.equal(planStudyRun(next, { event: 'schedule', campaignEnabled: true, runId: '61', runAttempt: 1 }).action, 'CAPTURE');
-  const resumed = begin(next, '2026-10-05', 'early', 61);
+  assert.throws(() => planStudyRun(next, { event: 'schedule', campaignEnabled: true, runId: '61', runAttempt: 1 }), /protocol mismatch/);
+  const extended = extendStudyAttemptBudget(next, '2026-10-06T10:00:00.000Z');
+  assert.equal(planStudyRun(extended, { event: 'schedule', campaignEnabled: true, runId: '61', runAttempt: 1 }).action, 'CAPTURE');
+  const resumed = begin(extended, '2026-10-06', 'early', 61);
   assert.equal(resumed.attempts.length, 61);
-  assert.deepEqual(migrateStudyAttemptBudget(resumed, '2026-10-06T10:00:00.000Z'), resumed);
+  assert.deepEqual(extendStudyAttemptBudget(resumed, '2026-10-07T10:00:00.000Z'), resumed);
   assert.deepEqual(acceptStudyChunk(resumed, old.chunks[0]!), resumed, 'old immutable receipt remains idempotent');
   assert.throws(() => acceptStudyChunk(resumed, { ...old.chunks[0]!, assetId: 56, assetName: 'late-old.tar.gz' }), /retired study protocol/);
   assert.throws(() => planStudyRun({ ...resumed, protocolHash: hex('9') },
@@ -151,7 +153,7 @@ test('explicit 60-to-100 migration preserves immutable history and admits attemp
 });
 
 test('migration receipt pins historical identities through optimistic merges', () => {
-  const migrated = migrateStudyAttemptBudget(predecessor(), '2026-10-05T10:00:00.000Z');
+  const migrated = extendStudyAttemptBudget(migrateStudyAttemptBudget(predecessor(), '2026-10-05T10:00:00.000Z'), '2026-10-06T10:00:00.000Z');
   const first = begin(migrated, '2026-10-05', 'early', 61);
   const second = begin(migrated, '2026-10-05', 'late', 62);
   const merged = mergeStudyLedgers(first, second);
@@ -162,6 +164,82 @@ test('migration receipt pins historical identities through optimistic merges', (
   assert.throws(() => begin({ ...first, canonicalChunks: {} },
     '2026-10-05', 'late', 63), /historical data changed/);
   assert.throws(() => mergeStudyLedgers(first, createStudyLedger()), /Conflicting study attempt-budget migrations/);
+});
+
+function hundredPredecessor(): StudyLedger {
+  const ledger = migrateStudyAttemptBudget(predecessor(), '2026-10-05T10:00:00.000Z');
+  const day = addDay(createStudyLedger(), '2026-09-15', 500);
+  ledger.attempts.push(...day.attempts);
+  ledger.chunks.push(...day.chunks.map(receipt => ({ ...receipt, protocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH })));
+  Object.assign(ledger.canonicalChunks, day.canonicalChunks);
+  ledger.days.push({ ...day.days[0]!, protocolHash: STUDY_100_ATTEMPT_PROTOCOL_HASH,
+    dayId: `${STUDY_100_ATTEMPT_PROTOCOL_HASH}:2026-09-15` });
+  return ledger;
+}
+
+test('100-to-120 extension preserves the original migration, receipts and already accepted day', () => {
+  const old = hundredPredecessor(), original = structuredClone(old);
+  const extended = extendStudyAttemptBudget(old, '2026-10-06T10:00:00.000Z');
+  assert.deepEqual(old, original);
+  assert.equal(extended.attemptBudgetExtension?.sourceLedgerHash, hashStudyValue(old));
+  assert.deepEqual(extended.attemptBudgetMigration, old.attemptBudgetMigration);
+  assert.deepEqual(extended.attempts, old.attempts);
+  assert.deepEqual(extended.chunks, old.chunks);
+  assert.deepEqual(extended.canonicalChunks, old.canonicalChunks);
+  assert.deepEqual(extended.days, old.days);
+  assert.equal(extended.days[0]!.protocolHash, STUDY_100_ATTEMPT_PROTOCOL_HASH);
+  assert.deepEqual(extendStudyAttemptBudget(extended, '2026-10-07T10:00:00.000Z'), extended);
+  assert.equal(planStudyRun(extended, { event: 'schedule', campaignEnabled: true, runId: 'new', runAttempt: 1 }).action, 'CAPTURE');
+  assert.throws(() => acceptStudyChunk(extended, { ...old.chunks.at(-1)!, assetId: 99999,
+    assetName: 'new-for-old-attempt.tar.gz', protocolHash: STUDY_PROTOCOL_HASH }), /Pre-extension attempt/);
+  assert.deepEqual(acceptStudyChunk(extended, old.chunks.at(-1)!), extended);
+  assert.throws(() => acceptStudyDay(extended, { ...old.days[0]!, protocolHash: STUDY_PROTOCOL_HASH,
+    dayId: `${STUDY_PROTOCOL_HASH}:2026-09-15`, reportAssetId: 88888 }), /Pre-extension study date/);
+});
+
+test('new 120-era receipt merges beside a finalized 100-era day without rewriting its science', () => {
+  const extended = extendStudyAttemptBudget(hundredPredecessor(), '2026-10-06T10:00:00.000Z');
+  const branch = chunk(begin(extended, '2026-10-07', 'early', 700), '2026-10-07', 'early', 700, 70001);
+  const merged = mergeStudyLedgers(extended, branch);
+  assert.equal(merged.chunks.length, extended.chunks.length + 1);
+  assert.deepEqual(merged.days, extended.days);
+  assert.deepEqual(merged.attemptBudgetMigration, extended.attemptBudgetMigration);
+  assert.deepEqual(merged.attemptBudgetExtension, extended.attemptBudgetExtension);
+  assert.equal(merged.days[0]!.protocolHash, STUDY_100_ATTEMPT_PROTOCOL_HASH);
+  assert.equal(merged.chunks.at(-1)!.protocolHash, STUDY_PROTOCOL_HASH);
+  assert.equal(merged.canonicalChunks['2026-10-07:early:1'], 70001);
+});
+
+test('extension rejects historical tampering and protects its attempt ceiling under races', () => {
+  const original = hundredPredecessor(), extended = extendStudyAttemptBudget(original, '2026-10-06T10:00:00.000Z');
+  const tamper = (change: (ledger: StudyLedger) => void) => {
+    const ledger = structuredClone(extended); change(ledger);
+    assert.throws(() => begin(ledger, '2026-10-07', 'early', 800), /historical data changed|migration receipt/);
+  };
+  tamper(ledger => { ledger.attempts[60]!.runId = 'rewritten'; });
+  tamper(ledger => { ledger.chunks.at(-1)!.archiveSha256 = hex('9'); });
+  tamper(ledger => { delete ledger.canonicalChunks['2026-09-15:early:1']; });
+  tamper(ledger => { ledger.days[0]!.reportArchiveSha256 = hex('9'); });
+  tamper(ledger => { ledger.attemptBudgetMigration!.sourceLedgerHash = hex('9'); });
+  tamper(ledger => { ledger.attemptBudgetExtension!.oldChunkCount -= 1; });
+  assert.throws(() => extendStudyAttemptBudget({ ...original, freeze: {
+    frozenAt: '2026-10-06T10:00:00Z', holdoutNotBeforeDate: '2026-10-07', protocolHash: original.protocolHash,
+    replayConfigHash: hex('a'), simulatorHashes: { simulator: hex('b') }, developmentDates: [],
+  } }, '2026-10-06T10:00:00Z'), /authorized/);
+  let almostFull = extended;
+  for (let index = almostFull.attempts.length + 1; index <= STUDY_MAX_ATTEMPTS - 1; index += 1) {
+    almostFull = begin(almostFull, '2026-10-07', index % 2 ? 'early' : 'late', index + 1000);
+  }
+  const left = begin(almostFull, '2026-10-07', 'early', 2000);
+  const right = begin(almostFull, '2026-10-07', 'late', 2001);
+  assert.equal(left.attempts.length, STUDY_MAX_ATTEMPTS);
+  assert.equal(planStudyRun(left, { event: 'schedule', campaignEnabled: true, runId: '2002', runAttempt: 1 }).action, 'ATTEMPT_LIMIT');
+  assert.throws(() => begin(left, '2026-10-07', 'late', 2002), /attempt limit/);
+  assert.throws(() => mergeStudyLedgers(left, right), /exceed the campaign limit/);
+  assert.throws(() => mergeStudyLedgers(extended, createStudyLedger()), /Conflicting study attempt-budget migrations/);
+  const conflicting = structuredClone(extended);
+  conflicting.attemptBudgetExtension!.migratedAt = '2026-10-06T10:01:00.000Z';
+  assert.throws(() => mergeStudyLedgers(extended, conflicting), /Conflicting study attempt-budget extensions/);
 });
 
 test('holdout capture must use the exact frozen replay source map', () => {

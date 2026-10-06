@@ -35,13 +35,13 @@ test('progress shows the real remaining budget without crediting partial days or
     phase: 'DEVELOPMENT', mode: 'COUNTED', startedAt: `${reportDate}T06:00:00Z`, status: 'STARTED' }));
   const before = JSON.stringify(ledger);
   const progress = studyProgress(ledger);
-  assert.equal(progress.usedAttempts, 61); assert.equal(progress.remainingAttempts, 39);
+  assert.equal(progress.usedAttempts, 61); assert.equal(progress.remainingAttempts, 59);
   assert.equal(progress.developmentDays, 0); assert.equal(progress.holdoutDays, 0);
-  assert.equal(progress.blocksForEntirelyNewDays, 40); assert.equal(progress.reserveForEntirelyNewDays, -1);
+  assert.equal(progress.blocksForEntirelyNewDays, 40); assert.equal(progress.reserveForEntirelyNewDays, 19);
   assert.equal(progress.frozen, false);
   const text = renderOperationalDay(operationalDay(ledger, [], reportDate, reportNow));
-  assert.match(text, /61\/100/); assert.match(text, /полностью новых дней/);
-  assert.match(text, /Лимит автоматически не увеличивается/);
+  assert.match(text, /61\/120/); assert.match(text, /полностью новых дней/);
+  assert.doesNotMatch(text, /Остаток попыток не покрывает/);
   assert.equal(JSON.stringify(ledger), before);
 });
 
